@@ -6,3 +6,6 @@ data/annotations/
 *.zip
 venv
 models
+ckpts
+video_data
+run.sh
