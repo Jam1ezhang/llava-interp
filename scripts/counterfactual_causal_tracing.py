@@ -95,12 +95,14 @@ def _make_counterfactuals(
     frames: List,
     swap_spans: Tuple[Tuple[int, int], Tuple[int, int]],
     include_motion_only: bool,
+    include_local_swap: bool,
 ) -> Dict[str, List]:
     counterfactuals = {
         "order_reverse": reverse_order(frames),
-        "local_swap": local_swap(frames, *swap_spans),
         "motion_destroy": motion_destroy(frames, mode="median"),
     }
+    if include_local_swap:
+        counterfactuals["local_swap"] = local_swap(frames, *swap_spans)
     if include_motion_only:
         counterfactuals["motion_only"] = motion_only(frames)
     return counterfactuals
@@ -188,6 +190,7 @@ def run_causal_tracing(
     annotations_path: str,
     video_root: str,
     output_path: str,
+    representations_output: Optional[str],
     model_id: str,
     device: str,
     num_frames: int,
@@ -215,6 +218,7 @@ def run_causal_tracing(
         layers = list(range(len(layers_attr)))
 
     results: Dict[str, Dict] = {}
+    representation_results: Optional[Dict[str, Dict]] = {} if representations_output else None
 
     for sample in tqdm(dataset):
         question_id = sample.get("question_id") or sample["video_path"]
@@ -253,10 +257,20 @@ def run_causal_tracing(
         if token_slice_spec.startswith("visual"):
             _ensure_visual_only(token_slice, visual_span)
 
+        t_eff = len(get_frame_token_spans(inputs_clean, model.processor))
+        include_local_swap = True
+        if "qwen" in model_id.lower() and t_eff < num_frames:
+            include_local_swap = False
+
         clean_logits = _score_option_logits(model, inputs_clean, labels)
         clean_margin = logit_margin(clean_logits, correct_index) if correct_index is not None else None
 
-        counterfactuals = _make_counterfactuals(frames, swap_spans, include_motion_only)
+        counterfactuals = _make_counterfactuals(
+            frames,
+            swap_spans,
+            include_motion_only,
+            include_local_swap,
+        )
         clean_inputs_embeds = model.get_text_model_in(frames, prompt)
 
         clean_cache: Dict[int, torch.Tensor] = {}
@@ -274,7 +288,7 @@ def run_causal_tracing(
             "clean_margin": clean_margin,
             "counterfactuals": {},
         }
-        if dump_representations:
+        if dump_representations and not representations_output:
             sample_result["representations"] = _collect_representations(
                 model,
                 inputs_clean,
@@ -283,6 +297,18 @@ def run_causal_tracing(
                 layers,
                 dump_frame_reps,
             )
+        if dump_representations and representation_results is not None:
+            representation_results[str(question_id)] = {
+                "representations": _collect_representations(
+                    model,
+                    inputs_clean,
+                    clean_inputs_embeds,
+                    token_slice,
+                    layers,
+                    dump_frame_reps,
+                ),
+                "counterfactuals": {},
+            }
 
         for name, cf_frames in counterfactuals.items():
             inputs_cf = model._prepare_inputs(cf_frames, prompt)
@@ -379,7 +405,7 @@ def run_causal_tracing(
             }
             if use_scores_by_span is not None:
                 cf_entry["use_scores_by_span"] = use_scores_by_span
-            if dump_representations:
+            if dump_representations and not representations_output:
                 cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
                 cf_entry["representations"] = _collect_representations(
                     model,
@@ -389,6 +415,18 @@ def run_causal_tracing(
                     layers,
                     dump_frame_reps,
                 )
+            if dump_representations and representation_results is not None:
+                cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
+                representation_results[str(question_id)]["counterfactuals"][name] = {
+                    "representations": _collect_representations(
+                        model,
+                        inputs_cf,
+                        cf_inputs_embeds,
+                        token_slice,
+                        layers,
+                        dump_frame_reps,
+                    )
+                }
 
             sample_result["counterfactuals"][name] = cf_entry
 
@@ -401,6 +439,12 @@ def run_causal_tracing(
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+    if representation_results is not None and representations_output:
+        rep_output_dir = os.path.dirname(representations_output)
+        if rep_output_dir:
+            os.makedirs(rep_output_dir, exist_ok=True)
+        with open(representations_output, "w", encoding="utf-8") as f:
+            json.dump(representation_results, f, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
@@ -408,6 +452,11 @@ def main() -> None:
     parser.add_argument("--annotations", required=True, help="Path to the video QA json file.")
     parser.add_argument("--video_root", required=True, help="Root directory containing video files.")
     parser.add_argument("--output", required=True, help="Path to save tracing results.")
+    parser.add_argument(
+        "--representations_output",
+        default=None,
+        help="Optional path to save representations separately from tracing results.",
+    )
     parser.add_argument(
         "--model_id",
         default="Qwen/Qwen2-VL-7B-Instruct",
@@ -448,6 +497,8 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.representations_output and not args.dump_representations:
+        raise ValueError("--representations_output requires --dump_representations.")
     span_parts = args.swap_spans.split(",")
     if len(span_parts) != 2:
         raise ValueError("swap_spans must contain two spans separated by a comma.")
@@ -463,6 +514,7 @@ def main() -> None:
         annotations_path=args.annotations,
         video_root=args.video_root,
         output_path=args.output,
+        representations_output=args.representations_output,
         model_id=args.model_id,
         device=args.device,
         num_frames=args.num_frames,
