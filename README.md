@@ -1,70 +1,146 @@
 # LLaVA Interpretability
 
-This repository provides code and resources for our paper, [Towards Interpreting Visual Information Processing in Vision-Language Models](https://arxiv.org/abs/2410.07149). Our work explores techniques like logit lens, token ablation, and attention blocking to better understand how vision-language models process visual data.
+This repository contains utilities and experiment scripts for interpreting video-capable vision-language models (e.g. Qwen2-VL). The focus is on counterfactual causal tracing, token-level patching, and representation probes over video QA datasets.
 
 ## Table of Contents
-- [Installation & Data Setup](#installation--data-setup)
+- [Installation](#installation)
+- [Data Preparation](#data-preparation)
+- [Repository Structure](#repository-structure)
 - [Usage](#usage)
-  - [Logit Lens](#1-logit-lens)
-  - [Token Ablation Experiments](#2-token-ablation-experiments)
-  - [Attention Blocking Experiments](#3-attention-blocking-experiments)
+  - [Run Video QA Inference](#run-video-qa-inference)
+  - [Counterfactual Causal Tracing](#counterfactual-causal-tracing)
+  - [Have-1/Have-2 Probes](#have-1have-2-probes)
+  - [Mean Vector Utilities](#mean-vector-utilities)
+  - [Token Indexing Smoke Test](#token-indexing-smoke-test)
 - [Citation](#citation)
 - [Contact](#contact)
 
-## Installation & Data Setup
+## Installation
 
 ### Prerequisites
-- Ensure you have Python 3.8+ and `pip` installed.
+- Python 3.8+
+- `pip`
 
 ### Steps
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/clemneo/llava-interp
    cd llava-interp
+   ```
 
+2. **Install required Python packages:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-2. Install required Python packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
+## Data Preparation
 
-3. Download and unzip the COCO dataset images (2017):
-    ```bash
-    wget -P data/ http://images.cocodataset.org/zips/train2017.zip
-    unzip data/train2017.zip -d data/
-    ```
-    > Note: The ZIP file is 19 GB, and the unzipped content is also 19 GB. Make sure you have at least 38 GB of free space available.
+The scripts in `scripts/` expect a video QA annotations JSON file and a directory of videos. A single annotation entry should look like:
 
-4. Download and unzip the annotations:
-    ```bash
-    wget -P data/ http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-    unzip data/annotations_trainval2017.zip -d data/
-    ```
+```json
+{
+  "video_name": "video_0001.mp4",
+  "question": "What is the person doing?",
+  "candidates": ["Walking", "Running", "Cooking"],
+  "answer": "Running",
+  "answer_number": 1,
+  "question_id": "0001",
+  "task_name": "action",
+  "start": 0.0,
+  "end": 2.5,
+  "frames_with_answer_object": [3, 4, 5]
+}
+```
+
+Only `video_name` and `question` are strictly required, but including `candidates`, `answer`, and timing metadata enables the causal tracing and probing utilities.
+
+## Repository Structure
+
+- `src/`
+  - `HookedLVLM.py`: Wrapper around the base VLM for hooking activations and patching.
+  - `activation_patching.py`: Utilities for caching and patching hidden states.
+  - `counterfactuals.py`: Counterfactual video transformations (swap, reverse, motion-only, etc.).
+  - `token_indexing.py`: Helpers to locate visual token spans and frame spans.
+  - `VideoDatasets.py`: `VideoQADataset` loader for the annotation JSON files.
+  - `video_utils.py`: Frame loading and prompt formatting.
+- `scripts/`
+  - `video_inference.py`: Run baseline video QA inference.
+  - `counterfactual_causal_tracing.py`: Perform counterfactual causal tracing experiments.
+  - `train_have_probe.py`: Train Have-1 / Have-2 probes from tracing outputs.
+  - `calculate_mean_vector.py`: Compute mean vectors from cached activation tensors.
+  - `test_token_indexing_smoke.py`: Small sanity check for token indexing.
 
 ## Usage
-### 1. Logit Lens
-* `scripts/logit_lens/create_logit_lens.py` Run the model and create interative logit lens HTMLs for a set of images
-* `scripts/logit_lens/generate_overview.py` Generate an `index.html` to view a set of logit_lens HTMLs files.
 
-### 2. Token Ablation Experiments
+### Run Video QA Inference
 
-**Preparation**
+```bash
+python scripts/video_inference.py \
+  --annotations data/clean_questions.json \
+  --video_root /path/to/videos \
+  --output outputs/inference.json \
+  --model_id Qwen/Qwen2-VL-7B-Instruct \
+  --device cuda:0 \
+  --num_frames 8
+```
 
-Before running ablation experiments, create the mean vector used for ablation:
-1. `scripts/save_post_adapter_acts.py` Caches activations of visual tokens
-2. `scripts/esimate_acts_size.py` Estimates the size of the total cache
-3. `scripts/calculate_mean_vector.py` Generates a mean vector using cached visual tokens.
+### Counterfactual Causal Tracing
 
-The mean vector used in the paper for LLaVA 1.5 and LLaVA-Phi can be found in `data/`.
+```bash
+python scripts/counterfactual_causal_tracing.py \
+  --annotations data/clean_questions.json \
+  --video_root /path/to/videos \
+  --output outputs/tracing.json \
+  --representations_output outputs/representations.json \
+  --model_id Qwen/Qwen2-VL-7B-Instruct \
+  --token_slice visual_frames:0:2 \
+  --swap_spans 0:2,2:4 \
+  --dump_representations
+```
 
-**Running Experiments**
-* `scripts/ablation_experiment.py` Runs ablation experiments on LLaVA 1.5 (generative and polling settings)
-* `scripts/ablation_experiment_curate.py` Runs ablation experiments on LLaVA-1.5 (VQA setting)
-* `scripts/ablation_experiment_phi.py` Runs ablation experiments on LLaVA-Phi (generative and polling settings)
-* `scripts/ablation_experiment_phi_curate.py` Runs ablation experiments on LLaVA-Phi (VQA setting)
+Notes:
+- Use `--token_slice visual` to patch all visual tokens, `text` for text tokens, or `visual_frames:start:end` to target specific frame spans.
+- Add `--include_motion_only` to include motion-only counterfactuals.
 
-### 3. Attention Blocking experiments
-* `scripts/attention_experiment_curate.py` Run attention blocking experiments on LLaVA 1.5
+### Have-1/Have-2 Probes
+
+```bash
+python scripts/train_have_probe.py \
+  --tracing_results outputs/tracing.json \
+  --representations outputs/representations.json \
+  --output outputs/have1_metrics.json \
+  --probe_type have1 \
+  --representation layers_mean \
+  --layer_idx 12
+```
+
+For Have-2 probes, supply annotations and a label key:
+
+```bash
+python scripts/train_have_probe.py \
+  --tracing_results outputs/tracing.json \
+  --representations outputs/representations.json \
+  --annotations data/clean_questions.json \
+  --label_key question_type \
+  --output outputs/have2_metrics.json \
+  --probe_type have2
+```
+
+### Mean Vector Utilities
+
+If you cache per-sample activation tensors (e.g. `*.pt` files), you can compute a mean vector:
+
+```bash
+python scripts/calculate_mean_vector.py /path/to/activation_cache --device cuda
+```
+
+This writes `mean_vector.pt` into the provided directory.
+
+### Token Indexing Smoke Test
+
+```bash
+python scripts/test_token_indexing_smoke.py
+```
 
 ## Citation
 To cite our work, please use the following BibTeX entry:
@@ -79,3 +155,6 @@ To cite our work, please use the following BibTeX entry:
       url={https://arxiv.org/abs/2410.07149}, 
 }
 ```
+
+## Contact
+For questions or issues, please open a GitHub issue on this repository.
