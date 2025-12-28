@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -23,14 +24,56 @@ def _label_candidates(candidates: List[str]) -> List[str]:
     return [chr(65 + idx) for idx in range(len(candidates))]
 
 
-def _resolve_correct_index(answer: Optional[str], candidates: List[str]) -> Optional[int]:
+def _resolve_correct_index(
+    answer: Optional[str], 
+    candidates: List[str], 
+    answer_number: Optional[int] = None
+) -> Optional[int]:
+    """解析正确答案的索引。
+    
+    Args:
+        answer: 答案文本（可能是部分文本，如 "clothes"）
+        candidates: 候选答案列表（完整文本，如 ["The closet/cabinet.", "The blanket.", "The clothes.", "The table."]）
+        answer_number: 答案编号（从 0 开始），如果提供则直接使用
+        
+    Returns:
+        正确答案在 candidates 中的索引，如果无法确定则返回 None
+    """
+    # 如果提供了 answer_number，直接使用（最可靠）
+    if answer_number is not None and 0 <= answer_number < len(candidates):
+        return answer_number
+    
     if answer is None:
         return None
+    
+    # 去除首尾空格并转换为小写，用于匹配
+    answer_normalized = answer.strip().lower()
+    
     labels = _label_candidates(candidates)
-    if answer in labels:
-        return labels.index(answer)
+    
+    # 1. 检查是否是标签（A, B, C, D...）
+    if answer.upper().strip() in labels:
+        return labels.index(answer.upper().strip())
+    
+    # 2. 精确匹配候选答案
     if answer in candidates:
         return candidates.index(answer)
+    
+    # 3. 大小写不敏感的精确匹配
+    for idx, candidate in enumerate(candidates):
+        if candidate.strip().lower() == answer_normalized:
+            return idx
+    
+    # 4. 部分匹配：检查 answer 是否是 candidate 的子串（或 candidate 包含 answer）
+    # 去除标点符号和多余空格后匹配
+    answer_clean = re.sub(r'[^\w\s]', '', answer_normalized)
+    for idx, candidate in enumerate(candidates):
+        candidate_clean = re.sub(r'[^\w\s]', '', candidate.strip().lower())
+        # 检查 answer 是否在 candidate 中，或 candidate 是否在 answer 中
+        if answer_clean in candidate_clean or candidate_clean in answer_clean:
+            return idx
+    
+    # 5. 如果仍然无法匹配，返回 None
     return None
 
 
@@ -193,7 +236,11 @@ def run_causal_tracing(
             continue
         prompt = format_multiple_choice(question, candidates)
         labels = _label_candidates(candidates)
-        correct_index = _resolve_correct_index(sample.get("answer"), candidates)
+        correct_index = _resolve_correct_index(
+            sample.get("answer"), 
+            candidates,
+            answer_number=sample.get("answer_number")
+        )
 
         inputs_clean = model._prepare_inputs(frames, prompt)
         token_slice = parse_slice(
@@ -262,7 +309,11 @@ def run_causal_tracing(
                 )
                 if name == "local_swap":
                     frame_spans = get_frame_token_spans(inputs_clean, model.processor)
-                    span_slices = get_span_token_slice(swap_spans, frame_spans)
+                    span_slices = get_span_token_slice(swap_spans, frame_spans, raw_T=num_frames)
+                    # 处理警告信息
+                    if "warnings" in span_slices:
+                        for warning in span_slices["warnings"]:
+                            print(f"[WARNING] {warning}")
                     text_slice = parse_slice(
                         "text",
                         inputs_clean["input_ids"].shape[1],

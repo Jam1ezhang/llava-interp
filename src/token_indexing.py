@@ -143,22 +143,47 @@ def get_visual_token_span(inputs: Dict, processor) -> slice:
     return span_result.span
 
 
+def infer_T_eff(visual_len: int, video_grid_thw: Tuple[int, int, int]) -> int:
+    """推断有效的帧数 T_eff，基于实际的视觉 token 长度。
+    
+    Args:
+        visual_len: 实际的视觉 token 数量（从 special tokens 得到）
+        video_grid_thw: (T, H, W) 元组，表示原始视频网格维度
+        
+    Returns:
+        有效的帧数 T_eff
+    """
+    t, h, w = video_grid_thw
+    tokens_per_frame = h * w
+    if tokens_per_frame == 0:
+        raise ValueError(f"Invalid video_grid_thw: tokens_per_frame (h*w) cannot be 0")
+    t_eff = visual_len // tokens_per_frame
+    if visual_len % tokens_per_frame != 0:
+        raise ValueError(
+            f"Visual token length {visual_len} is not divisible by tokens_per_frame {tokens_per_frame}. "
+            f"This may indicate an inconsistent tokenization."
+        )
+    return t_eff
+
+
 def get_frame_token_spans(inputs: Dict, processor) -> List[slice]:
-    """Return a list of token spans, one per frame in the video."""
+    """Return a list of token spans, one per bin in the video.
+    
+    使用 T_eff 而不是 video_grid_thw 的 T 来分组，以处理下采样情况。
+    """
 
     visual_span = get_visual_token_span(inputs, processor)
+    visual_len = visual_span.stop - visual_span.start
     t, h, w = _get_video_grid_thw(inputs)
-    tokens_per_frame = h * w
-    total_tokens = tokens_per_frame * t
-    if visual_span.stop - visual_span.start != total_tokens:
-        raise ValueError(
-            "Visual span length does not match video_grid_thw. "
-            f"Expected {total_tokens} tokens, got {visual_span.stop - visual_span.start}."
-        )
+    
+    # 使用 T_eff 而不是原始的 T
+    t_eff = infer_T_eff(visual_len, (t, h, w))
+    tokens_per_bin = visual_len // t_eff
+    
     spans = []
-    for frame_idx in range(t):
-        start = visual_span.start + frame_idx * tokens_per_frame
-        end = start + tokens_per_frame
+    for bin_idx in range(t_eff):
+        start = visual_span.start + bin_idx * tokens_per_bin
+        end = start + tokens_per_bin
         spans.append(slice(start, end))
     return spans
 
@@ -181,23 +206,88 @@ def _merge_slices(slices: Iterable[slice]) -> List[slice]:
 def get_span_token_slice(
     frame_spans: Tuple[Tuple[int, int], Tuple[int, int]],
     frame_token_spans: Sequence[slice],
+    raw_T: Optional[int] = None,
 ) -> Dict[str, List[slice]]:
     """Resolve token slices for two swapped frame spans.
 
-    Returns a dict containing spanA_slice, spanB_slice, and union_slice (merged slices).
+    Args:
+        frame_spans: ((startA, endA), (startB, endB)) 在原始帧空间的 span
+        frame_token_spans: 基于 T_eff 的 token spans（每个 bin 一个 span）
+        raw_T: 原始帧数（如果提供，用于将 raw 帧空间的 span 映射到 bins）
+        
+    Returns:
+        dict containing spanA_slice, spanB_slice, and union_slice (merged slices).
+        如果映射后两个 span 不可区分，会记录警告信息。
     """
 
-    max_frames = len(frame_token_spans)
+    t_eff = len(frame_token_spans)
     span_slices: Dict[str, List[slice]] = {}
-    for name, (start, end) in zip(("spanA", "spanB"), frame_spans):
-        if start < 0 or end > max_frames or start >= end:
-            raise ValueError(f"Invalid frame span {start}:{end} for {name} with {max_frames} frames.")
-        span_slices[name] = list(frame_token_spans[start:end])
+    warnings: List[str] = []
+    
+    # 如果提供了 raw_T，需要将 raw 帧空间的 span 映射到 T_eff 的 bins
+    if raw_T is not None and raw_T > t_eff:
+        # 计算每个 bin 包含多少原始帧
+        frames_per_bin = raw_T / t_eff
+        
+        mapped_spans = []
+        for name, (start, end) in zip(("spanA", "spanB"), frame_spans):
+            if start < 0 or end > raw_T or start >= end:
+                raise ValueError(
+                    f"Invalid frame span {start}:{end} for {name} with {raw_T} raw frames."
+                )
+            
+            # 映射到 bin 索引
+            bin_start = int(start / frames_per_bin)
+            bin_end = int((end - 1) / frames_per_bin) + 1  # 向上取整
+            
+            # 确保 bin 索引在有效范围内
+            bin_start = max(0, min(bin_start, t_eff - 1))
+            bin_end = max(bin_start + 1, min(bin_end, t_eff))
+            
+            mapped_spans.append((name, bin_start, bin_end))
+        
+        # 检查映射后是否可区分
+        (nameA, binA_start, binA_end), (nameB, binB_start, binB_end) = mapped_spans
+        if binA_start == binB_start and binA_end == binB_end:
+            warnings.append(
+                f"Warning: Spans {frame_spans[0]} and {frame_spans[1]} in raw frame space "
+                f"map to the same bin range [{binA_start}:{binA_end}] after downsampling. "
+                f"Skipping fine-grained distinction."
+            )
+            # 如果不可区分，返回空列表
+            return {
+                "spanA_slice": [],
+                "spanB_slice": [],
+                "union_slice": [],
+                "warnings": warnings,
+            }
+        
+        # 使用映射后的 bin 索引
+        for name, bin_start, bin_end in mapped_spans:
+            if bin_start < 0 or bin_end > t_eff or bin_start >= bin_end:
+                raise ValueError(
+                    f"Invalid mapped bin span {bin_start}:{bin_end} for {name} with {t_eff} bins."
+                )
+            span_slices[name] = list(frame_token_spans[bin_start:bin_end])
+    else:
+        # 直接使用 frame_spans，假设它们已经在 T_eff 空间
+        max_frames = t_eff
+        for name, (start, end) in zip(("spanA", "spanB"), frame_spans):
+            if start < 0 or end > max_frames or start >= end:
+                raise ValueError(
+                    f"Invalid frame span {start}:{end} for {name} with {max_frames} frames."
+                )
+            span_slices[name] = list(frame_token_spans[start:end])
 
     union = _merge_slices(span_slices["spanA"] + span_slices["spanB"])
     span_slices["union"] = union
-    return {
+    
+    result = {
         "spanA_slice": span_slices["spanA"],
         "spanB_slice": span_slices["spanB"],
         "union_slice": span_slices["union"],
     }
+    if warnings:
+        result["warnings"] = warnings
+    
+    return result

@@ -94,7 +94,7 @@ class HookedLVLM:
                 return args, kwargs
             modified_input = input_embeds.clone()
             local_replacement_tensor = replacement_tensor.to(modified_input.dtype).to(modified_input.device)
-            local_replacement_tensor.unsqueeze(0).expand(len(indices), -1)
+            local_replacement_tensor = local_replacement_tensor.reshape(1, -1).expand(len(indices), -1)
             modified_input[:, indices, :] = local_replacement_tensor
             kwargs["inputs_embeds"] = modified_input
             return args, kwargs

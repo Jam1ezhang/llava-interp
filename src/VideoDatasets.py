@@ -31,6 +31,7 @@ class VideoQADataset(Dataset):
             "question": item["question"],
             "candidates": item.get("candidates", []),
             "answer": item.get("answer"),
+            "answer_number": item.get("answer_number"),
             "question_id": item.get("question_id"),
             "task_name": item.get("task_name"),
             "start": item.get("start"),
