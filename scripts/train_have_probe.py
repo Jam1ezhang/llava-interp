@@ -75,6 +75,29 @@ def _load_tracing_results(path: str) -> Dict:
         return json.load(f)
 
 
+def _load_representation_results(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _merge_representations(tracing: Dict, representations: Dict) -> Dict:
+    for sample_id, rep_entry in representations.items():
+        sample = tracing.get(sample_id)
+        if not sample:
+            continue
+        if "representations" in rep_entry:
+            sample["representations"] = rep_entry["representations"]
+        rep_counterfactuals = rep_entry.get("counterfactuals", {})
+        if not rep_counterfactuals:
+            continue
+        tracing_counterfactuals = sample.setdefault("counterfactuals", {})
+        for cf_name, cf_rep_entry in rep_counterfactuals.items():
+            cf_sample = tracing_counterfactuals.setdefault(cf_name, {})
+            if "representations" in cf_rep_entry:
+                cf_sample["representations"] = cf_rep_entry["representations"]
+    return tracing
+
+
 def _load_annotations(path: str) -> Dict[str, Dict]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -246,6 +269,11 @@ def _train_probe(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Have-1/Have-2 probes on tracing outputs.")
     parser.add_argument("--tracing_results", required=True, help="Path to causal tracing results JSON.")
+    parser.add_argument(
+        "--representations",
+        default=None,
+        help="Optional path to representations JSON saved separately from tracing results.",
+    )
     parser.add_argument("--output", required=True, help="Path to save probe metrics JSON.")
     parser.add_argument(
         "--probe_type",
@@ -280,6 +308,9 @@ def main() -> None:
 
     args = parser.parse_args()
     tracing = _load_tracing_results(args.tracing_results)
+    if args.representations:
+        representations = _load_representation_results(args.representations)
+        tracing = _merge_representations(tracing, representations)
     config = ProbeConfig(
         model_type=args.model_type,
         hidden_dim=args.hidden_dim,
