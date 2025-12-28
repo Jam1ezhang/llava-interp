@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -14,6 +14,7 @@ from activation_patching import PatchSpec, capture_layer_outputs, patch_inputs, 
 from causal_metrics import logit_margin, normalized_use_score, parse_slice, pool_hidden_states
 from counterfactuals import local_swap, motion_destroy, motion_only, reverse_order
 from HookedLVLM import HookedLVLM
+from token_indexing import get_frame_token_spans, get_span_token_slice, get_visual_token_span
 from VideoDatasets import VideoQADataset
 from video_utils import format_multiple_choice, load_video_frames
 
@@ -62,19 +63,31 @@ def _make_counterfactuals(
     return counterfactuals
 
 
+TokenSlice = Union[slice, Sequence[slice]]
+
+
+def _frame_means(hidden_states: torch.Tensor, frame_spans: Sequence[slice]) -> List[List[float]]:
+    return [pool_hidden_states(hidden_states, span).squeeze(0).tolist() for span in frame_spans]
+
+
 def _collect_representations(
     model: HookedLVLM,
-    frames: List,
-    prompt: str,
-    token_slice: slice,
+    inputs: Dict,
+    inputs_embeds: torch.Tensor,
+    token_slice: TokenSlice,
     layers: Iterable[int],
-) -> Dict[str, List[List[float]]]:
-    inputs = model._prepare_inputs(frames, prompt)
-    inputs_embeds = model.get_text_model_in(frames, prompt)
-    reps: Dict[str, List[List[float]]] = {
+    dump_frame_reps: bool,
+) -> Dict[str, object]:
+    visual_span = get_visual_token_span(inputs, model.processor)
+    frame_spans = get_frame_token_spans(inputs, model.processor)
+    reps: Dict[str, object] = {
         "inputs_mean": pool_hidden_states(inputs_embeds, token_slice).squeeze(0).tolist(),
         "layers_mean": [],
+        "visual_mean": pool_hidden_states(inputs_embeds, visual_span).squeeze(0).tolist(),
     }
+    if dump_frame_reps:
+        reps["frame_means"] = _frame_means(inputs_embeds, frame_spans)
+        reps["layers_frame_means"] = []
 
     cache: Dict[int, torch.Tensor] = {}
     handles = capture_layer_outputs(model.text_model, layers, cache)
@@ -85,8 +98,47 @@ def _collect_representations(
 
     for layer in layers:
         reps["layers_mean"].append(pool_hidden_states(cache[layer], token_slice).squeeze(0).tolist())
+        if dump_frame_reps:
+            reps["layers_frame_means"].append(_frame_means(cache[layer], frame_spans))
 
     return reps
+
+
+def _ensure_visual_only(token_slice: TokenSlice, visual_span: slice) -> None:
+    slices = [token_slice] if isinstance(token_slice, slice) else list(token_slice)
+    for sl in slices:
+        if sl.start < visual_span.start or sl.stop > visual_span.stop:
+            raise ValueError("token_slice includes text tokens; expected only visual token spans.")
+
+
+def _compute_use_scores(
+    model: HookedLVLM,
+    inputs_cf: Dict,
+    labels: List[str],
+    correct_index: int,
+    cf_margin: float,
+    total_effect: float,
+    clean_inputs_embeds: torch.Tensor,
+    clean_cache: Dict[int, torch.Tensor],
+    token_slice: TokenSlice,
+    layers: Iterable[int],
+) -> Dict[str, Optional[float]]:
+    patch_results: Dict[str, Optional[float]] = {}
+    with patch_inputs(model.text_model, clean_inputs_embeds, token_slice):
+        patched_logits = _score_option_logits(model, inputs_cf, labels)
+    patched_margin = logit_margin(patched_logits, correct_index)
+    recovered = patched_margin - cf_margin
+    patch_results["inputs"] = normalized_use_score(recovered, total_effect)
+
+    for layer in layers:
+        spec = PatchSpec(layer=layer, token_slice=token_slice)
+        with patch_layer_outputs(model.text_model, clean_cache, spec):
+            layer_logits = _score_option_logits(model, inputs_cf, labels)
+        layer_margin = logit_margin(layer_logits, correct_index)
+        recovered = layer_margin - cf_margin
+        patch_results[str(layer)] = normalized_use_score(recovered, total_effect)
+
+    return patch_results
 
 
 def run_causal_tracing(
@@ -102,6 +154,7 @@ def run_causal_tracing(
     include_motion_only: bool,
     limit: Optional[int],
     dump_representations: bool,
+    dump_frame_reps: bool,
 ) -> None:
     dataset = VideoQADataset(annotations_path=annotations_path, video_root=video_root, max_samples=limit)
     model = HookedLVLM(model_id=model_id, device=device, quantize=False)
@@ -135,7 +188,15 @@ def run_causal_tracing(
         correct_index = _resolve_correct_index(sample.get("answer"), candidates)
 
         inputs_clean = model._prepare_inputs(frames, prompt)
-        token_slice = parse_slice(token_slice_spec, inputs_clean["input_ids"].shape[1])
+        token_slice = parse_slice(
+            token_slice_spec,
+            inputs_clean["input_ids"].shape[1],
+            inputs=inputs_clean,
+            processor=model.processor,
+        )
+        visual_span = get_visual_token_span(inputs_clean, model.processor)
+        if token_slice_spec.startswith("visual"):
+            _ensure_visual_only(token_slice, visual_span)
 
         clean_logits = _score_option_logits(model, inputs_clean, labels)
         clean_margin = logit_margin(clean_logits, correct_index) if correct_index is not None else None
@@ -161,10 +222,11 @@ def run_causal_tracing(
         if dump_representations:
             sample_result["representations"] = _collect_representations(
                 model,
-                frames,
-                prompt,
+                inputs_clean,
+                clean_inputs_embeds,
                 token_slice,
                 layers,
+                dump_frame_reps,
             )
 
         for name, cf_frames in counterfactuals.items():
@@ -176,20 +238,79 @@ def run_causal_tracing(
                 total_effect = clean_margin - cf_margin
 
             patch_results: Dict[str, Optional[float]] = {}
+            use_scores_by_span: Optional[Dict[str, Dict[str, Optional[float]]]] = None
             if total_effect is not None:
-                with patch_inputs(model.text_model, clean_inputs_embeds, token_slice):
-                    patched_logits = _score_option_logits(model, inputs_cf, labels)
-                patched_margin = logit_margin(patched_logits, correct_index)
-                recovered = patched_margin - cf_margin
-                patch_results["inputs"] = normalized_use_score(recovered, total_effect)
-
-                for layer in layers:
-                    spec = PatchSpec(layer=layer, token_slice=token_slice)
-                    with patch_layer_outputs(model.text_model, clean_cache, spec):
-                        layer_logits = _score_option_logits(model, inputs_cf, labels)
-                    layer_margin = logit_margin(layer_logits, correct_index)
-                    recovered = layer_margin - cf_margin
-                    patch_results[str(layer)] = normalized_use_score(recovered, total_effect)
+                patch_results = _compute_use_scores(
+                    model,
+                    inputs_cf,
+                    labels,
+                    correct_index,
+                    cf_margin,
+                    total_effect,
+                    clean_inputs_embeds,
+                    clean_cache,
+                    token_slice,
+                    layers,
+                )
+                if name == "local_swap":
+                    frame_spans = get_frame_token_spans(inputs_clean, model.processor)
+                    span_slices = get_span_token_slice(swap_spans, frame_spans)
+                    text_slice = parse_slice(
+                        "text",
+                        inputs_clean["input_ids"].shape[1],
+                        inputs=inputs_clean,
+                        processor=model.processor,
+                    )
+                    use_scores_by_span = {
+                        "spanA": _compute_use_scores(
+                            model,
+                            inputs_cf,
+                            labels,
+                            correct_index,
+                            cf_margin,
+                            total_effect,
+                            clean_inputs_embeds,
+                            clean_cache,
+                            span_slices["spanA_slice"],
+                            layers,
+                        ),
+                        "spanB": _compute_use_scores(
+                            model,
+                            inputs_cf,
+                            labels,
+                            correct_index,
+                            cf_margin,
+                            total_effect,
+                            clean_inputs_embeds,
+                            clean_cache,
+                            span_slices["spanB_slice"],
+                            layers,
+                        ),
+                        "union": _compute_use_scores(
+                            model,
+                            inputs_cf,
+                            labels,
+                            correct_index,
+                            cf_margin,
+                            total_effect,
+                            clean_inputs_embeds,
+                            clean_cache,
+                            span_slices["union_slice"],
+                            layers,
+                        ),
+                        "text_only": _compute_use_scores(
+                            model,
+                            inputs_cf,
+                            labels,
+                            correct_index,
+                            cf_margin,
+                            total_effect,
+                            clean_inputs_embeds,
+                            clean_cache,
+                            text_slice,
+                            layers,
+                        ),
+                    }
 
             cf_entry: Dict[str, object] = {
                 "logits": cf_logits,
@@ -197,13 +318,17 @@ def run_causal_tracing(
                 "total_effect": total_effect,
                 "use_scores": patch_results,
             }
+            if use_scores_by_span is not None:
+                cf_entry["use_scores_by_span"] = use_scores_by_span
             if dump_representations:
+                cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
                 cf_entry["representations"] = _collect_representations(
                     model,
-                    cf_frames,
-                    prompt,
+                    inputs_cf,
+                    cf_inputs_embeds,
                     token_slice,
                     layers,
+                    dump_frame_reps,
                 )
 
             sample_result["counterfactuals"][name] = cf_entry
@@ -233,8 +358,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--token_slice",
-        default="all",
-        help="Token slice spec for patching, e.g. 'all' or '0:128'.",
+        default="visual",
+        help="Token slice spec for patching, e.g. 'visual', 'text', 'visual_frames:0:2', or '0:128'.",
     )
     parser.add_argument(
         "--layers",
@@ -251,6 +376,11 @@ def main() -> None:
         "--dump_representations",
         action="store_true",
         help="Store pooled representations for Have metrics.",
+    )
+    parser.add_argument(
+        "--dump_frame_reps",
+        action="store_true",
+        help="Include per-frame representations (can be large).",
     )
 
     args = parser.parse_args()
@@ -278,6 +408,7 @@ def main() -> None:
         include_motion_only=args.include_motion_only,
         limit=args.limit,
         dump_representations=args.dump_representations,
+        dump_frame_reps=args.dump_frame_reps,
     )
 
 

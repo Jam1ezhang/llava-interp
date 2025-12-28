@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 file_dir = os.path.dirname(__file__)
 sys.path.append(os.path.abspath(os.path.join(file_dir, "..", "src")))
@@ -24,9 +24,10 @@ class ProbeConfig:
 
 
 class RepresentationDataset(Dataset):
-    def __init__(self, features: List[List[float]], labels: List[int]):
+    def __init__(self, features: List[List[float]], labels: List[int], groups: Optional[List[str]] = None):
         self.features = torch.tensor(features, dtype=torch.float32)
         self.labels = torch.tensor(labels, dtype=torch.long)
+        self.groups = groups or [""] * len(labels)
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -60,6 +61,8 @@ class MLPProbe(nn.Module):
 def _select_representation(representations: Dict, rep_key: str, layer_idx: Optional[int]) -> List[float]:
     if rep_key == "inputs_mean":
         return representations["inputs_mean"]
+    if rep_key == "visual_mean":
+        return representations["visual_mean"]
     if rep_key == "layers_mean":
         if layer_idx is None:
             raise ValueError("layer_idx must be provided when using layers_mean.")
@@ -90,7 +93,8 @@ def _build_have1_dataset(
 ) -> RepresentationDataset:
     features: List[List[float]] = []
     labels: List[int] = []
-    for _, sample in tracing.items():
+    groups: List[str] = []
+    for sample_id, sample in tracing.items():
         reps = sample.get("representations")
         if not reps:
             continue
@@ -101,10 +105,13 @@ def _build_have1_dataset(
                 cf_rep = cf.get("representations")
                 if not cf_rep:
                     continue
-                features.append(clean_vec)
+                cf_vec = _select_representation(cf_rep, rep_key, layer_idx)
+                features.append(clean_vec + cf_vec)
                 labels.append(1)
-                features.append(_select_representation(cf_rep, rep_key, layer_idx))
+                groups.append(str(sample_id))
+                features.append(cf_vec + clean_vec)
                 labels.append(0)
+                groups.append(str(sample_id))
         else:
             cf = sample.get("counterfactuals", {}).get(counterfactual_type)
             if not cf:
@@ -112,11 +119,14 @@ def _build_have1_dataset(
             cf_rep = cf.get("representations")
             if not cf_rep:
                 continue
-            features.append(clean_vec)
+            cf_vec = _select_representation(cf_rep, rep_key, layer_idx)
+            features.append(clean_vec + cf_vec)
             labels.append(1)
-            features.append(_select_representation(cf_rep, rep_key, layer_idx))
+            groups.append(str(sample_id))
+            features.append(cf_vec + clean_vec)
             labels.append(0)
-    return RepresentationDataset(features, labels)
+            groups.append(str(sample_id))
+    return RepresentationDataset(features, labels, groups)
 
 
 def _build_have2_dataset(
@@ -128,6 +138,7 @@ def _build_have2_dataset(
 ) -> Tuple[RepresentationDataset, Dict[int, str]]:
     features: List[List[float]] = []
     labels: List[int] = []
+    groups: List[str] = []
     label_map: Dict[str, int] = {}
     for sample_id, sample in tracing.items():
         reps = sample.get("representations")
@@ -141,8 +152,39 @@ def _build_have2_dataset(
             label_map[raw_label] = len(label_map)
         features.append(_select_representation(reps, rep_key, layer_idx))
         labels.append(label_map[raw_label])
+        groups.append(str(sample_id))
     index_to_label = {idx: label for label, idx in label_map.items()}
-    return RepresentationDataset(features, labels), index_to_label
+    return RepresentationDataset(features, labels, groups), index_to_label
+
+
+def _group_split(dataset: RepresentationDataset, seed: int, val_fraction: float = 0.2) -> Tuple[List[int], List[int]]:
+    unique_groups = sorted(set(dataset.groups))
+    if not unique_groups:
+        return list(range(len(dataset))), []
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(len(unique_groups), generator=generator).tolist()
+    val_size = max(1, int(val_fraction * len(unique_groups)))
+    if val_size >= len(unique_groups):
+        val_size = len(unique_groups) - 1
+    val_groups = set(unique_groups[idx] for idx in perm[:val_size])
+    train_indices = [i for i, group in enumerate(dataset.groups) if group not in val_groups]
+    val_indices = [i for i, group in enumerate(dataset.groups) if group in val_groups]
+    if not train_indices:
+        train_indices = val_indices
+    return train_indices, val_indices
+
+
+def _binary_auroc(scores: List[float], labels: List[int]) -> float:
+    paired = sorted(zip(scores, labels), key=lambda x: x[0])
+    pos = sum(labels)
+    neg = len(labels) - pos
+    if pos == 0 or neg == 0:
+        return 0.0
+    rank_sum = 0.0
+    for rank, (_, label) in enumerate(paired, start=1):
+        if label == 1:
+            rank_sum += rank
+    return (rank_sum - pos * (pos + 1) / 2) / (pos * neg)
 
 
 def _train_probe(
@@ -153,11 +195,11 @@ def _train_probe(
     if len(dataset) == 0:
         raise ValueError("No samples available for training. Check representations and labels.")
     torch.manual_seed(config.seed)
-    val_size = max(1, int(0.2 * len(dataset)))
-    train_size = len(dataset) - val_size
-    train_set, val_set = random_split(dataset, [train_size, val_size])
-    train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=config.batch_size)
+    train_indices, val_indices = _group_split(dataset, config.seed)
+    train_subset = torch.utils.data.Subset(dataset, train_indices)
+    val_subset = torch.utils.data.Subset(dataset, val_indices)
+    train_loader = DataLoader(train_subset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=config.batch_size)
 
     input_dim = dataset.features.shape[1]
     if config.model_type == "linear":
@@ -182,13 +224,23 @@ def _train_probe(
     model.eval()
     correct = 0
     total = 0
+    scores: List[float] = []
+    labels: List[int] = []
     with torch.no_grad():
         for x, y in val_loader:
-            preds = model(x).argmax(dim=1)
+            logits = model(x)
+            preds = logits.argmax(dim=1)
             correct += (preds == y).sum().item()
             total += y.numel()
+            if output_dim == 2:
+                probs = torch.softmax(logits, dim=1)[:, 1]
+                scores.extend(probs.tolist())
+                labels.extend(y.tolist())
     accuracy = correct / total if total > 0 else 0.0
-    return {"val_accuracy": accuracy}
+    metrics = {"val_accuracy": accuracy}
+    if output_dim == 2 and labels:
+        metrics["val_auroc"] = _binary_auroc(scores, labels)
+    return metrics
 
 
 def main() -> None:
@@ -203,7 +255,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--representation",
-        choices=["inputs_mean", "layers_mean"],
+        choices=["inputs_mean", "layers_mean", "visual_mean"],
         default="inputs_mean",
         help="Representation key to probe.",
     )

@@ -2,24 +2,34 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
+
+
+TokenSlice = Union[slice, Sequence[slice]]
 
 
 @dataclass
 class PatchSpec:
     layer: Optional[int]
-    token_slice: slice
+    token_slice: TokenSlice
+
+
+def _normalize_slices(token_slice: TokenSlice) -> Sequence[slice]:
+    if isinstance(token_slice, slice):
+        return [token_slice]
+    return list(token_slice)
 
 
 def _replace_hidden_states(
     hidden_states: torch.Tensor,
     replacement: torch.Tensor,
-    token_slice: slice,
+    token_slice: TokenSlice,
 ) -> torch.Tensor:
     patched = hidden_states.clone()
-    patched[:, token_slice, :] = replacement[:, token_slice, :]
+    for sl in _normalize_slices(token_slice):
+        patched[:, sl, :] = replacement[:, sl, :]
     return patched
 
 
@@ -80,12 +90,13 @@ def patch_layer_outputs(
 def patch_inputs(
     model: torch.nn.Module,
     clean_inputs: torch.Tensor,
-    token_slice: slice,
+    token_slice: TokenSlice,
 ):
     def hook(module, args, kwargs):
         inputs_embeds = kwargs["inputs_embeds"]
         patched = inputs_embeds.clone()
-        patched[:, token_slice, :] = clean_inputs[:, token_slice, :]
+        for sl in _normalize_slices(token_slice):
+            patched[:, sl, :] = clean_inputs[:, sl, :]
         kwargs["inputs_embeds"] = patched
         return args, kwargs
 
