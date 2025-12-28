@@ -108,7 +108,15 @@ def run_causal_tracing(
     model.model.eval()
 
     if layers is None:
-        layers = list(range(len(model.text_model.model.layers)))
+        # 尝试多种方式访问 layers 属性
+        text_model = model.text_model
+        if hasattr(text_model, "model") and hasattr(text_model.model, "layers"):
+            layers_attr = text_model.model.layers
+        elif hasattr(text_model, "layers"):
+            layers_attr = text_model.layers
+        else:
+            raise AttributeError(f"Could not find layers attribute in text_model of type {type(text_model)}")
+        layers = list(range(len(layers_attr)))
 
     results: Dict[str, Dict] = {}
 
@@ -209,6 +217,11 @@ def run_causal_tracing(
             sample_result["counterfactuals"][name] = cf_entry
 
         results[str(question_id)] = sample_result
+
+    # 确保输出目录存在
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

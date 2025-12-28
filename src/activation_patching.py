@@ -38,10 +38,18 @@ def capture_layer_outputs(
 ) -> list[torch.utils.hooks.RemovableHandle]:
     handles = []
 
-    for layer_idx in layers:
-        layer = model.model.layers[layer_idx]
+    # 尝试多种方式访问 layers 属性
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers_attr = model.model.layers
+    elif hasattr(model, "layers"):
+        layers_attr = model.layers
+    else:
+        raise AttributeError(f"Could not find layers attribute in model of type {type(model)}")
 
-        def hook(module, args, kwargs, output, layer_idx=layer_idx):
+    for layer_idx in layers:
+        layer = layers_attr[layer_idx]
+
+        def hook(module, input, output, layer_idx=layer_idx):
             hidden, _ = _maybe_extract_hidden(output)
             cache[layer_idx] = hidden.detach()
 
@@ -60,9 +68,17 @@ def patch_layer_outputs(
     if layer_idx is None:
         raise ValueError("PatchSpec.layer must be set for layer patching.")
 
-    layer = model.model.layers[layer_idx]
+    # 尝试多种方式访问 layers 属性
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers_attr = model.model.layers
+    elif hasattr(model, "layers"):
+        layers_attr = model.layers
+    else:
+        raise AttributeError(f"Could not find layers attribute in model of type {type(model)}")
 
-    def hook(module, args, kwargs, output):
+    layer = layers_attr[layer_idx]
+
+    def hook(module, input, output):
         hidden, rest = _maybe_extract_hidden(output)
         patched = _replace_hidden_states(hidden, clean_cache[layer_idx], patch_spec.token_slice)
         if rest:
