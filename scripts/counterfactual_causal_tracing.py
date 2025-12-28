@@ -95,12 +95,14 @@ def _make_counterfactuals(
     frames: List,
     swap_spans: Tuple[Tuple[int, int], Tuple[int, int]],
     include_motion_only: bool,
+    include_local_swap: bool,
 ) -> Dict[str, List]:
     counterfactuals = {
         "order_reverse": reverse_order(frames),
-        "local_swap": local_swap(frames, *swap_spans),
         "motion_destroy": motion_destroy(frames, mode="median"),
     }
+    if include_local_swap:
+        counterfactuals["local_swap"] = local_swap(frames, *swap_spans)
     if include_motion_only:
         counterfactuals["motion_only"] = motion_only(frames)
     return counterfactuals
@@ -255,10 +257,20 @@ def run_causal_tracing(
         if token_slice_spec.startswith("visual"):
             _ensure_visual_only(token_slice, visual_span)
 
+        t_eff = len(get_frame_token_spans(inputs_clean, model.processor))
+        include_local_swap = True
+        if "qwen" in model_id.lower() and t_eff < num_frames:
+            include_local_swap = False
+
         clean_logits = _score_option_logits(model, inputs_clean, labels)
         clean_margin = logit_margin(clean_logits, correct_index) if correct_index is not None else None
 
-        counterfactuals = _make_counterfactuals(frames, swap_spans, include_motion_only)
+        counterfactuals = _make_counterfactuals(
+            frames,
+            swap_spans,
+            include_motion_only,
+            include_local_swap,
+        )
         clean_inputs_embeds = model.get_text_model_in(frames, prompt)
 
         clean_cache: Dict[int, torch.Tensor] = {}
