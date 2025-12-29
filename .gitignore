@@ -9,3 +9,7 @@ models
 ckpts
 video_data
 run.sh
+infer
+data
+qwen2.log
+scripts/sample_json.py
