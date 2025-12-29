@@ -8,7 +8,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -29,7 +29,6 @@ class ProbeConfig:
     batch_size: int  # 批次大小
     seed: int = 42  # 随机种子
     lstm_layers: int = 1  # LSTM层数
-    lstm_seq_len: Optional[int] = None  # LSTM序列长度，None表示自动计算
 
 
 class RepresentationDataset(Dataset):
@@ -53,6 +52,35 @@ class RepresentationDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取指定索引的数据样本"""
         return self.features[idx], self.labels[idx]
+
+
+class SequenceRepresentationDataset(Dataset):
+    """序列表示数据集，用于加载形状为 (seq_len, feature_dim) 的张量"""
+    def __init__(self, entries: List[Dict[str, object]], groups: Optional[List[str]] = None):
+        """
+        初始化数据集
+        Args:
+            entries: 样本条目，包含路径与标签
+            groups: 可选的分组信息列表
+        """
+        self.entries = entries
+        self.groups = groups or [""] * len(entries)
+
+    def __len__(self) -> int:
+        """返回数据集大小"""
+        return len(self.entries)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取指定索引的数据样本"""
+        entry = self.entries[idx]
+        label = torch.tensor(entry["label"], dtype=torch.long)
+        if entry["type"] == "single":
+            tensor = torch.load(entry["path"], map_location="cpu")
+        else:
+            first = torch.load(entry["path_a"], map_location="cpu")
+            second = torch.load(entry["path_b"], map_location="cpu")
+            tensor = torch.cat([first, second], dim=0)
+        return tensor.float(), label
 
 
 class LinearProbe(nn.Module):
@@ -95,93 +123,52 @@ class MLPProbe(nn.Module):
 
 
 class LSTMProbe(nn.Module):
-    """LSTM探针模型：使用LSTM处理特征向量的序列表示"""
+    """LSTM探针模型：使用LSTM处理序列表示"""
     def __init__(
         self, 
-        input_dim: int, 
+        input_size: int, 
         hidden_dim: int, 
         output_dim: int,
         num_layers: int = 1,
-        seq_len: Optional[int] = None
     ):
         """
         初始化LSTM探针
         Args:
-            input_dim: 输入特征维度（总维度）
+            input_size: 输入特征维度（每个时间步）
             hidden_dim: LSTM隐藏层维度
             output_dim: 输出维度（类别数）
             num_layers: LSTM层数
-            seq_len: 序列长度，如果为None则根据input_dim自动计算（将特征向量分割为序列）
         """
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
-        
-        # 自动计算序列长度：将特征向量分成合理的chunks
-        # 每个chunk的特征维度将作为LSTM的输入特征维度
-        if seq_len is None:
-            # 尝试找到一个合理的序列长度，使得每个时间步的特征维度不会太小
-            # 目标：每个时间步至少32维，最多不超过hidden_dim
-            feature_dim_per_step = min(max(32, hidden_dim // 4), input_dim)
-            self.seq_len = max(1, input_dim // feature_dim_per_step)
-            self.feature_dim_per_step = input_dim // self.seq_len
-        else:
-            self.seq_len = seq_len
-            self.feature_dim_per_step = input_dim // seq_len
-            if self.feature_dim_per_step <= 0:
-                raise ValueError(f"seq_len ({seq_len}) must be <= input_dim ({input_dim})")
-        
-        # LSTM层：输入特征维度是每个时间步的特征维度
         self.lstm = nn.LSTM(
-            input_size=self.feature_dim_per_step,
+            input_size=input_size,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=False
         )
-        
-        # 输出层：将LSTM的最后一个时间步的输出映射到类别数
         self.fc = nn.Linear(hidden_dim, output_dim)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         Args:
-            x: 输入张量，形状为 (batch_size, input_dim)
+            x: 输入张量，形状为 (batch_size, seq_len, input_size)
         Returns:
             输出logits，形状为 (batch_size, output_dim)
         """
-        batch_size = x.shape[0]
-        
-        # 将特征向量重塑为序列：(batch_size, seq_len, feature_dim_per_step)
-        # 如果input_dim不能被seq_len整除，需要对最后一个chunk进行padding
-        remainder = self.input_dim % self.seq_len
-        if remainder > 0:
-            # 如果无法整除，在末尾padding零
-            padding_size = self.seq_len - remainder
-            x = torch.nn.functional.pad(x, (0, padding_size), mode='constant', value=0)
-            # 重新计算实际的特征维度（应该等于feature_dim_per_step或稍大）
-            actual_feature_dim = (self.input_dim + padding_size) // self.seq_len
-        else:
-            actual_feature_dim = self.feature_dim_per_step
-        
-        # 重塑为序列：(batch_size, seq_len, actual_feature_dim)
-        x_seq = x.view(batch_size, self.seq_len, actual_feature_dim)
-        
-        # 通过LSTM处理序列
         # lstm_out的形状：(batch_size, seq_len, hidden_dim)
-        lstm_out, (h_n, c_n) = self.lstm(x_seq)
-        
-        # 使用最后一个时间步的输出
+        lstm_out, _ = self.lstm(x)
         last_hidden = lstm_out[:, -1, :]  # (batch_size, hidden_dim)
-        
-        # 通过全连接层得到输出logits
         output = self.fc(last_hidden)
         return output
 
 
-def _select_representation(representations: Dict, rep_key: str, layer_idx: Optional[int]) -> List[float]:
+def _select_representation(
+    representations: Dict,
+    rep_key: str,
+    layer_idx: Optional[int],
+) -> Union[List[float], str]:
     """
     从表示字典中选择指定的表示向量
     Args:
@@ -201,6 +188,8 @@ def _select_representation(representations: Dict, rep_key: str, layer_idx: Optio
         if layer_idx is None:
             raise ValueError("layer_idx must be provided when using layers_mean.")
         return representations["layers_mean"][layer_idx]
+    if rep_key == "vprime_path":
+        return representations["vprime_path"]
     raise ValueError(f"Unknown representation key: {rep_key}")
 
 
@@ -279,7 +268,8 @@ def _build_have1_dataset(
     counterfactual_type: str,
     rep_key: str,
     layer_idx: Optional[int],
-) -> RepresentationDataset:
+    have1_mode: str,
+) -> Union[RepresentationDataset, SequenceRepresentationDataset]:
     """
     构建Have-1数据集：区分原始表示和反事实表示的二元分类任务
     每个样本对会生成两个训练样本：正样本(原始+反事实)和负样本(反事实+原始)
@@ -291,9 +281,13 @@ def _build_have1_dataset(
     Returns:
         Have-1数据集
     """
-    features: List[List[float]] = []
-    labels: List[int] = []
-    groups: List[str] = []
+    if rep_key == "vprime_path":
+        entries: List[Dict[str, object]] = []
+        groups: List[str] = []
+    else:
+        features: List[List[float]] = []
+        labels: List[int] = []
+        groups = []
     for sample_id, sample in tracing.items():
         reps = sample.get("representations")
         if not reps:
@@ -308,14 +302,38 @@ def _build_have1_dataset(
                 if not cf_rep:
                     continue
                 cf_vec = _select_representation(cf_rep, rep_key, layer_idx)
-                # 正样本：原始向量 + 反事实向量
-                features.append(clean_vec + cf_vec)
-                labels.append(1)
-                groups.append(str(sample_id))
-                # 负样本：反事实向量 + 原始向量
-                features.append(cf_vec + clean_vec)
-                labels.append(0)
-                groups.append(str(sample_id))
+                if rep_key == "vprime_path":
+                    if have1_mode == "single":
+                        entries.append({"type": "single", "path": clean_vec, "label": 1})
+                        groups.append(str(sample_id))
+                        entries.append({"type": "single", "path": cf_vec, "label": 0})
+                        groups.append(str(sample_id))
+                    else:
+                        entries.append(
+                            {"type": "pair", "path_a": clean_vec, "path_b": cf_vec, "label": 1}
+                        )
+                        groups.append(str(sample_id))
+                        entries.append(
+                            {"type": "pair", "path_a": cf_vec, "path_b": clean_vec, "label": 0}
+                        )
+                        groups.append(str(sample_id))
+                else:
+                    if have1_mode == "single":
+                        features.append(clean_vec)
+                        labels.append(1)
+                        groups.append(str(sample_id))
+                        features.append(cf_vec)
+                        labels.append(0)
+                        groups.append(str(sample_id))
+                    else:
+                        # 正样本：原始向量 + 反事实向量
+                        features.append(clean_vec + cf_vec)
+                        labels.append(1)
+                        groups.append(str(sample_id))
+                        # 负样本：反事实向量 + 原始向量
+                        features.append(cf_vec + clean_vec)
+                        labels.append(0)
+                        groups.append(str(sample_id))
         else:
             # 使用指定类型的反事实
             cf = sample.get("counterfactuals", {}).get(counterfactual_type)
@@ -325,14 +343,36 @@ def _build_have1_dataset(
             if not cf_rep:
                 continue
             cf_vec = _select_representation(cf_rep, rep_key, layer_idx)
-            # 正样本：原始向量 + 反事实向量
-            features.append(clean_vec + cf_vec)
-            labels.append(1)
-            groups.append(str(sample_id))
-            # 负样本：反事实向量 + 原始向量
-            features.append(cf_vec + clean_vec)
-            labels.append(0)
-            groups.append(str(sample_id))
+            if rep_key == "vprime_path":
+                if have1_mode == "single":
+                    entries.append({"type": "single", "path": clean_vec, "label": 1})
+                    groups.append(str(sample_id))
+                    entries.append({"type": "single", "path": cf_vec, "label": 0})
+                    groups.append(str(sample_id))
+                else:
+                    entries.append({"type": "pair", "path_a": clean_vec, "path_b": cf_vec, "label": 1})
+                    groups.append(str(sample_id))
+                    entries.append({"type": "pair", "path_a": cf_vec, "path_b": clean_vec, "label": 0})
+                    groups.append(str(sample_id))
+            else:
+                if have1_mode == "single":
+                    features.append(clean_vec)
+                    labels.append(1)
+                    groups.append(str(sample_id))
+                    features.append(cf_vec)
+                    labels.append(0)
+                    groups.append(str(sample_id))
+                else:
+                    # 正样本：原始向量 + 反事实向量
+                    features.append(clean_vec + cf_vec)
+                    labels.append(1)
+                    groups.append(str(sample_id))
+                    # 负样本：反事实向量 + 原始向量
+                    features.append(cf_vec + clean_vec)
+                    labels.append(0)
+                    groups.append(str(sample_id))
+    if rep_key == "vprime_path":
+        return SequenceRepresentationDataset(entries, groups)
     return RepresentationDataset(features, labels, groups)
 
 
@@ -342,7 +382,7 @@ def _build_have2_dataset(
     label_key: str,
     rep_key: str,
     layer_idx: Optional[int],
-) -> Tuple[RepresentationDataset, Dict[int, str]]:
+) -> Tuple[Union[RepresentationDataset, SequenceRepresentationDataset], Dict[int, str]]:
     """
     构建Have-2数据集：基于表示预测样本标签的多分类任务
     Args:
@@ -354,9 +394,13 @@ def _build_have2_dataset(
     Returns:
         数据集和标签索引到标签名的映射字典
     """
-    features: List[List[float]] = []
-    labels: List[int] = []
-    groups: List[str] = []
+    if rep_key == "vprime_path":
+        entries: List[Dict[str, object]] = []
+        groups: List[str] = []
+    else:
+        features: List[List[float]] = []
+        labels: List[int] = []
+        groups = []
     label_map: Dict[str, int] = {}  # 标签名到索引的映射
     
     for sample_id, sample in tracing.items():
@@ -371,16 +415,32 @@ def _build_have2_dataset(
         if raw_label not in label_map:
             label_map[raw_label] = len(label_map)
         # 添加特征和标签
-        features.append(_select_representation(reps, rep_key, layer_idx))
-        labels.append(label_map[raw_label])
-        groups.append(str(sample_id))
+        if rep_key == "vprime_path":
+            entries.append(
+                {
+                    "type": "single",
+                    "path": _select_representation(reps, rep_key, layer_idx),
+                    "label": label_map[raw_label],
+                }
+            )
+            groups.append(str(sample_id))
+        else:
+            features.append(_select_representation(reps, rep_key, layer_idx))
+            labels.append(label_map[raw_label])
+            groups.append(str(sample_id))
     
     # 构建索引到标签名的反向映射
     index_to_label = {idx: label for label, idx in label_map.items()}
+    if rep_key == "vprime_path":
+        return SequenceRepresentationDataset(entries, groups), index_to_label
     return RepresentationDataset(features, labels, groups), index_to_label
 
 
-def _group_split(dataset: RepresentationDataset, seed: int, val_fraction: float = 0.2) -> Tuple[List[int], List[int]]:
+def _group_split(
+    dataset: Union[RepresentationDataset, SequenceRepresentationDataset],
+    seed: int,
+    val_fraction: float = 0.2,
+) -> Tuple[List[int], List[int]]:
     """
     按组划分数据集，确保同一组的数据不会同时出现在训练集和验证集中
     Args:
@@ -446,7 +506,7 @@ def _binary_auroc(scores: List[float], labels: List[int]) -> float:
 
 
 def _train_probe(
-    dataset: RepresentationDataset,
+    dataset: Union[RepresentationDataset, SequenceRepresentationDataset],
     config: ProbeConfig,
     output_dim: int,
 ) -> Dict[str, float]:
@@ -482,18 +542,27 @@ def _train_probe(
     val_loader = DataLoader(val_subset, batch_size=config.batch_size)
 
     # 创建模型
-    input_dim = dataset.features.shape[1]
+    sample_x, _ = dataset[0]
+    if sample_x.dim() == 1:
+        input_dim = sample_x.shape[0]
+    else:
+        input_dim = sample_x.shape[1]
     if config.model_type == "linear":
+        if sample_x.dim() != 1:
+            raise ValueError("linear probe expects 1D input tensors.")
         model = LinearProbe(input_dim, output_dim)
     elif config.model_type == "mlp":
+        if sample_x.dim() != 1:
+            raise ValueError("mlp probe expects 1D input tensors.")
         model = MLPProbe(input_dim, config.hidden_dim, output_dim)
     elif config.model_type == "lstm":
+        if sample_x.dim() != 2:
+            raise ValueError("lstm probe expects 2D input tensors.")
         model = LSTMProbe(
-            input_dim=input_dim,
+            input_size=input_dim,
             hidden_dim=config.hidden_dim,
             output_dim=output_dim,
             num_layers=config.lstm_layers,
-            seq_len=config.lstm_seq_len
         )
     else:
         raise ValueError(f"Unknown model_type: {config.model_type}")
@@ -572,7 +641,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--representation",
-        choices=["inputs_mean", "layers_mean", "visual_mean"],
+        choices=["inputs_mean", "layers_mean", "visual_mean", "vprime_path"],
         default="inputs_mean",
         help="Representation key to probe.",
     )
@@ -589,17 +658,17 @@ def main() -> None:
         help="Annotation key to use as label for have2.",
     )
     parser.add_argument("--model_type", choices=["linear", "mlp", "lstm"], default="linear")
-    parser.add_argument("--hidden_dim", type=int, default=1024)
+    parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lstm_layers", type=int, default=1, help="Number of LSTM layers (for LSTM model)")
     parser.add_argument(
-        "--lstm_seq_len", 
-        type=int, 
-        default=None, 
-        help="Sequence length for LSTM model. If None, automatically calculated."
+        "--have1_mode",
+        choices=["single", "pair"],
+        default="pair",
+        help="Have-1 mode: single (clean vs cf) or pair (concat clean/cf).",
     )
 
     args = parser.parse_args()
@@ -621,19 +690,25 @@ def main() -> None:
         batch_size=args.batch_size,
         seed=args.seed,
         lstm_layers=args.lstm_layers,
-        lstm_seq_len=args.lstm_seq_len,
     )
 
     # 根据探针类型构建数据集并训练
     if args.probe_type == "have1":
         # Have-1: 二元分类任务（区分原始和反事实）
-        dataset = _build_have1_dataset(tracing, args.counterfactual_type, args.representation, args.layer_idx)
+        dataset = _build_have1_dataset(
+            tracing,
+            args.counterfactual_type,
+            args.representation,
+            args.layer_idx,
+            args.have1_mode,
+        )
         output_dim = 2
         metrics = _train_probe(dataset, config, output_dim)
         output = {
             "probe_type": "have1",
             "counterfactual_type": args.counterfactual_type,
             "representation": args.representation,
+            "have1_mode": args.have1_mode,
             "layer_idx": args.layer_idx,
             "metrics": metrics,
             "num_samples": len(dataset),

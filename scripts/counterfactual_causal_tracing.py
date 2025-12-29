@@ -6,6 +6,7 @@ import sys
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 file_dir = os.path.dirname(__file__)
@@ -156,6 +157,26 @@ def _ensure_visual_only(token_slice: TokenSlice, visual_span: slice) -> None:
             raise ValueError("token_slice includes text tokens; expected only visual token spans.")
 
 
+def _save_vprime(
+    inputs: Dict,
+    inputs_embeds: torch.Tensor,
+    processor,
+    out_path: str,
+    n_prime: int,
+    d_prime: int,
+) -> str:
+    visual_span = get_visual_token_span(inputs, processor)
+    v = inputs_embeds[:, visual_span, :].squeeze(0)
+    vprime = F.interpolate(
+        v.float().unsqueeze(0).unsqueeze(0),
+        size=(n_prime, d_prime),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).squeeze(0)
+    torch.save(vprime.to(torch.float16).cpu(), out_path)
+    return out_path
+
+
 def _compute_use_scores(
     model: HookedLVLM,
     inputs_cf: Dict,
@@ -201,6 +222,10 @@ def run_causal_tracing(
     limit: Optional[int],
     dump_representations: bool,
     dump_frame_reps: bool,
+    dump_vprime: bool,
+    vprime_n: int,
+    vprime_d: int,
+    vprime_out_dir: Optional[str],
 ) -> None:
     dataset = VideoQADataset(annotations_path=annotations_path, video_root=video_root, max_samples=limit)
     model = HookedLVLM(model_id=model_id, device=device, quantize=False)
@@ -219,6 +244,12 @@ def run_causal_tracing(
 
     results: Dict[str, Dict] = {}
     representation_results: Optional[Dict[str, Dict]] = {} if representations_output else None
+
+    resolved_vprime_dir: Optional[str] = None
+    if dump_vprime:
+        base_dir = os.path.dirname(output_path)
+        resolved_vprime_dir = vprime_out_dir or os.path.join(base_dir, "vprime")
+        os.makedirs(resolved_vprime_dir, exist_ok=True)
 
     for sample in tqdm(dataset):
         question_id = sample.get("question_id") or sample["video_path"]
@@ -289,7 +320,7 @@ def run_causal_tracing(
             "counterfactuals": {},
         }
         if dump_representations and not representations_output:
-            sample_result["representations"] = _collect_representations(
+            representations = _collect_representations(
                 model,
                 inputs_clean,
                 clean_inputs_embeds,
@@ -297,16 +328,38 @@ def run_causal_tracing(
                 layers,
                 dump_frame_reps,
             )
-        if dump_representations and representation_results is not None:
-            representation_results[str(question_id)] = {
-                "representations": _collect_representations(
-                    model,
+            if dump_vprime and resolved_vprime_dir is not None:
+                vprime_path = os.path.join(resolved_vprime_dir, f"sample_{question_id}_clean_vprime.pt")
+                representations["vprime_path"] = _save_vprime(
                     inputs_clean,
                     clean_inputs_embeds,
-                    token_slice,
-                    layers,
-                    dump_frame_reps,
-                ),
+                    model.processor,
+                    vprime_path,
+                    vprime_n,
+                    vprime_d,
+                )
+            sample_result["representations"] = representations
+        if dump_representations and representation_results is not None:
+            representations = _collect_representations(
+                model,
+                inputs_clean,
+                clean_inputs_embeds,
+                token_slice,
+                layers,
+                dump_frame_reps,
+            )
+            if dump_vprime and resolved_vprime_dir is not None:
+                vprime_path = os.path.join(resolved_vprime_dir, f"sample_{question_id}_clean_vprime.pt")
+                representations["vprime_path"] = _save_vprime(
+                    inputs_clean,
+                    clean_inputs_embeds,
+                    model.processor,
+                    vprime_path,
+                    vprime_n,
+                    vprime_d,
+                )
+            representation_results[str(question_id)] = {
+                "representations": representations,
                 "counterfactuals": {},
             }
 
@@ -407,7 +460,7 @@ def run_causal_tracing(
                 cf_entry["use_scores_by_span"] = use_scores_by_span
             if dump_representations and not representations_output:
                 cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
-                cf_entry["representations"] = _collect_representations(
+                representations = _collect_representations(
                     model,
                     inputs_cf,
                     cf_inputs_embeds,
@@ -415,17 +468,51 @@ def run_causal_tracing(
                     layers,
                     dump_frame_reps,
                 )
-            if dump_representations and representation_results is not None:
-                cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
-                representation_results[str(question_id)]["counterfactuals"][name] = {
-                    "representations": _collect_representations(
-                        model,
+                if dump_vprime and resolved_vprime_dir is not None:
+                    suffix = name
+                    if name == "local_swap":
+                        suffix = f"{name}_{swap_spans[0][0]}-{swap_spans[0][1]}_{swap_spans[1][0]}-{swap_spans[1][1]}"
+                    vprime_path = os.path.join(
+                        resolved_vprime_dir,
+                        f"sample_{question_id}_{suffix}_vprime.pt",
+                    )
+                    representations["vprime_path"] = _save_vprime(
                         inputs_cf,
                         cf_inputs_embeds,
-                        token_slice,
-                        layers,
-                        dump_frame_reps,
+                        model.processor,
+                        vprime_path,
+                        vprime_n,
+                        vprime_d,
                     )
+                cf_entry["representations"] = representations
+            if dump_representations and representation_results is not None:
+                cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
+                representations = _collect_representations(
+                    model,
+                    inputs_cf,
+                    cf_inputs_embeds,
+                    token_slice,
+                    layers,
+                    dump_frame_reps,
+                )
+                if dump_vprime and resolved_vprime_dir is not None:
+                    suffix = name
+                    if name == "local_swap":
+                        suffix = f"{name}_{swap_spans[0][0]}-{swap_spans[0][1]}_{swap_spans[1][0]}-{swap_spans[1][1]}"
+                    vprime_path = os.path.join(
+                        resolved_vprime_dir,
+                        f"sample_{question_id}_{suffix}_vprime.pt",
+                    )
+                    representations["vprime_path"] = _save_vprime(
+                        inputs_cf,
+                        cf_inputs_embeds,
+                        model.processor,
+                        vprime_path,
+                        vprime_n,
+                        vprime_d,
+                    )
+                representation_results[str(question_id)]["counterfactuals"][name] = {
+                    "representations": representations
                 }
 
             sample_result["counterfactuals"][name] = cf_entry
@@ -495,10 +582,24 @@ def main() -> None:
         action="store_true",
         help="Include per-frame representations (can be large).",
     )
+    parser.add_argument(
+        "--dump_vprime",
+        action="store_true",
+        help="Dump downsampled visual token matrices to .pt files.",
+    )
+    parser.add_argument("--vprime_n", type=int, default=128, help="Target token dimension for vprime.")
+    parser.add_argument("--vprime_d", type=int, default=1024, help="Target hidden dimension for vprime.")
+    parser.add_argument(
+        "--vprime_out_dir",
+        default=None,
+        help="Directory to save vprime .pt files (default: output_dir/vprime).",
+    )
 
     args = parser.parse_args()
     if args.representations_output and not args.dump_representations:
         raise ValueError("--representations_output requires --dump_representations.")
+    if args.dump_vprime and not args.dump_representations:
+        raise ValueError("--dump_vprime requires --dump_representations.")
     span_parts = args.swap_spans.split(",")
     if len(span_parts) != 2:
         raise ValueError("swap_spans must contain two spans separated by a comma.")
@@ -525,6 +626,10 @@ def main() -> None:
         limit=args.limit,
         dump_representations=args.dump_representations,
         dump_frame_reps=args.dump_frame_reps,
+        dump_vprime=args.dump_vprime,
+        vprime_n=args.vprime_n,
+        vprime_d=args.vprime_d,
+        vprime_out_dir=args.vprime_out_dir,
     )
 
 

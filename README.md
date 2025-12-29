@@ -101,6 +101,7 @@ python scripts/counterfactual_causal_tracing.py \
 Notes:
 - Use `--token_slice visual` to patch all visual tokens, `text` for text tokens, or `visual_frames:start:end` to target specific frame spans.
 - Add `--include_motion_only` to include motion-only counterfactuals.
+- Add `--dump_vprime` (with optional `--vprime_n`, `--vprime_d`, `--vprime_out_dir`) to export downsampled visual token matrices to `.pt` files and store their paths as `representations["vprime_path"]`.
 
 ### Have-1/Have-2 Probes
 
@@ -112,6 +113,19 @@ python scripts/train_have_probe.py \
   --probe_type have1 \
   --representation layers_mean \
   --layer_idx 12
+```
+
+To probe sequence representations saved via `--dump_vprime`, use the LSTM probe and set `--representation vprime_path`:
+
+```bash
+python scripts/train_have_probe.py \
+  --tracing_results outputs/tracing.json \
+  --representations outputs/representations.json \
+  --output outputs/have1_vprime_metrics.json \
+  --probe_type have1 \
+  --representation vprime_path \
+  --model_type lstm \
+  --have1_mode single
 ```
 
 For Have-2 probes, supply annotations and a label key:
