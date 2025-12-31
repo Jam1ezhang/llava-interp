@@ -112,6 +112,44 @@ def _make_counterfactuals(
 TokenSlice = Union[slice, Sequence[slice]]
 
 
+def _serialize_slice(span: slice) -> List[int]:
+    return [span.start, span.stop]
+
+
+def _alignment_metadata(
+    model: HookedLVLM,
+    inputs: Dict,
+    inputs_embeds: torch.Tensor,
+    visual_span: slice,
+    frame_spans: Sequence[slice],
+) -> Dict[str, object]:
+    input_ids = inputs.get("input_ids")
+    l_ids = int(input_ids.shape[1]) if input_ids is not None else None
+    l_emb = int(inputs_embeds.shape[1])
+    image_token_id = getattr(model.model.config, "image_token_index", None)
+    if image_token_id is None and hasattr(model.processor, "tokenizer"):
+        image_token_id = model.processor.tokenizer.convert_tokens_to_ids("<image>")
+
+    n_placeholders = None
+    k = None
+    if image_token_id is not None and input_ids is not None:
+        placeholder_positions = (input_ids[0] == image_token_id).nonzero(as_tuple=False).flatten()
+        n_placeholders = int(placeholder_positions.numel())
+        if n_placeholders > 0 and l_ids is not None:
+            diff = l_emb - l_ids
+            if diff % n_placeholders == 0:
+                k = int(1 + diff // n_placeholders)
+
+    return {
+        "L_ids": l_ids,
+        "L_emb": l_emb,
+        "n_placeholders": n_placeholders,
+        "k": k,
+        "visual_span": _serialize_slice(visual_span),
+        "frame_spans": [_serialize_slice(span) for span in frame_spans],
+    }
+
+
 def _frame_means(hidden_states: torch.Tensor, frame_spans: Sequence[slice]) -> List[List[float]]:
     return [pool_hidden_states(hidden_states, span).squeeze(0).tolist() for span in frame_spans]
 
@@ -283,6 +321,13 @@ def run_causal_tracing(
             clean_inputs_embeds,
             num_frames,
         )
+        alignment_metadata = _alignment_metadata(
+            model,
+            inputs_clean,
+            clean_inputs_embeds,
+            visual_span,
+            frame_spans,
+        )
         token_slice = parse_slice(
             token_slice_spec,
             seq_len,
@@ -321,6 +366,7 @@ def run_causal_tracing(
             "answer": sample.get("answer"),
             "clean_logits": clean_logits,
             "clean_margin": clean_margin,
+            "alignment_metadata": alignment_metadata,
             "counterfactuals": {},
         }
         if dump_representations and not representations_output:
@@ -367,6 +413,7 @@ def run_causal_tracing(
             representation_results[str(question_id)] = {
                 "representations": representations,
                 "counterfactuals": {},
+                "alignment_metadata": alignment_metadata,
             }
 
         for name, cf_frames in counterfactuals.items():
