@@ -72,6 +72,7 @@ def _find_special_token_span(input_ids: List[int], tokenizer) -> Optional[Visual
 
 
 def _get_video_grid_thw(inputs: Dict) -> Tuple[int, int, int]:
+    """Qwen-only: read video_grid_thw for Qwen2-VL-style visual token layouts."""
     grid = inputs.get("video_grid_thw")
     if grid is None:
         raise ValueError("inputs must include 'video_grid_thw' for fallback visual token localization.")
@@ -144,7 +145,7 @@ def get_visual_token_span(inputs: Dict, processor) -> slice:
 
 
 def infer_T_eff(visual_len: int, video_grid_thw: Tuple[int, int, int]) -> int:
-    """推断有效的帧数 T_eff，基于实际的视觉 token 长度。
+    """Qwen-only: 推断有效的帧数 T_eff，基于实际的视觉 token 长度。
     
     Args:
         visual_len: 实际的视觉 token 数量（从 special tokens 得到）
@@ -167,8 +168,8 @@ def infer_T_eff(visual_len: int, video_grid_thw: Tuple[int, int, int]) -> int:
 
 
 def get_frame_token_spans(inputs: Dict, processor) -> List[slice]:
-    """Return a list of token spans, one per bin in the video.
-    
+    """Qwen-only: Return a list of token spans, one per bin in the video.
+
     使用 T_eff 而不是 video_grid_thw 的 T 来分组，以处理下采样情况。
     """
 

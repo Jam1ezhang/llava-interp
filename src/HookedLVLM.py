@@ -1,10 +1,10 @@
 import os
 from contextlib import contextmanager
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 import yaml
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from adapters.factory import make_adapter
 
 from video_utils import load_video_frames
 
@@ -61,30 +61,20 @@ class HookedLVLM:
         quantize: bool = False,
         quantize_type: str = "fp16",
     ):
-        model_kwargs: Dict[str, object] = {
-            "device_map": device,
-            "cache_dir": model_cache_dir,
-        }
-        if quantize:
-            if quantize_type == "4bit":
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-                model_kwargs["torch_dtype"] = torch.float16
-                model_kwargs["low_cpu_mem_usage"] = True
-            elif quantize_type == "fp16":
-                model_kwargs["torch_dtype"] = torch.float16
-                model_kwargs["low_cpu_mem_usage"] = True
-            elif quantize_type == "int8":
-                model_kwargs["torch_dtype"] = torch.int8
-                model_kwargs["low_cpu_mem_usage"] = True
+        torch_dtype = torch.float16
+        if quantize and quantize_type == "int8":
+            torch_dtype = torch.int8
 
-        self.model = AutoModelForVision2Seq.from_pretrained(model_id, **model_kwargs)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.adapter = make_adapter(model_id, device, torch_dtype, quantize)
+        self.adapter.cache_dir = model_cache_dir
+        self.adapter.quantize_type = quantize_type
+        self.adapter.load()
+
+        self.model = self.adapter.model
+        self.processor = self.adapter.processor
         self.hook_loc = hook_loc
         self.data = None
-        self.text_model = getattr(self.model, "language_model", None) or getattr(self.model, "model", self.model)
+        self.text_model = self.adapter.get_text_model()
 
     @contextmanager
     def ablate_inputs(self, indices, replacement_tensor):
@@ -132,14 +122,6 @@ class HookedLVLM:
         self.data = kwargs["inputs_embeds"]
         return output
 
-    def _build_prompt(self, question: str) -> str:
-        if hasattr(self.processor, "apply_chat_template"):
-            messages = [
-                {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": question}]},
-            ]
-            return self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        return f"USER: <video>\n{question} ASSISTANT:"
-
     def _prepare_inputs(
         self,
         video: Union[str, List],
@@ -153,9 +135,7 @@ class HookedLVLM:
         else:
             video_frames = video
 
-        prompt = self._build_prompt(question)
-        inputs = self.processor(text=prompt, videos=[video_frames], return_tensors="pt")
-        return inputs.to(self.model.device)
+        return self.adapter.prepare_inputs(video_frames, question)
 
     def forward(
         self,
