@@ -50,17 +50,27 @@ def _parse_open_range(spec: str) -> Tuple[Optional[int], Optional[int]]:
     return start, end
 
 
-def parse_slice(spec: str, max_len: int, inputs: Optional[Dict] = None, processor: Optional[object] = None) -> TokenSlice:
+def parse_slice(
+    spec: str,
+    max_len: int,
+    inputs: Optional[Dict] = None,
+    processor: Optional[object] = None,
+    visual_span: Optional[slice] = None,
+    frame_spans: Optional[Sequence[slice]] = None,
+) -> TokenSlice:
     if spec == "all":
         return slice(0, max_len)
     if spec == "visual":
+        if visual_span is not None:
+            return visual_span
         if inputs is None or processor is None:
             raise ValueError("parse_slice('visual') requires inputs and processor.")
         return get_visual_token_span(inputs, processor)
     if spec == "text":
-        if inputs is None or processor is None:
-            raise ValueError("parse_slice('text') requires inputs and processor.")
-        visual_span = get_visual_token_span(inputs, processor)
+        if visual_span is None:
+            if inputs is None or processor is None:
+                raise ValueError("parse_slice('text') requires inputs and processor.")
+            visual_span = get_visual_token_span(inputs, processor)
         text_slices = [
             slice(0, visual_span.start),
             slice(visual_span.stop, max_len),
@@ -70,10 +80,11 @@ def parse_slice(spec: str, max_len: int, inputs: Optional[Dict] = None, processo
             raise ValueError("No text tokens found outside the visual span.")
         return text_slices
     if spec.startswith("visual_frames:"):
-        if inputs is None or processor is None:
-            raise ValueError("parse_slice('visual_frames') requires inputs and processor.")
         frame_part = spec.split("visual_frames:", 1)[1]
-        frame_spans = get_frame_token_spans(inputs, processor)
+        if frame_spans is None:
+            if inputs is None or processor is None:
+                raise ValueError("parse_slice('visual_frames') requires inputs and processor.")
+            frame_spans = get_frame_token_spans(inputs, processor)
         start, end = _parse_open_range(frame_part)
         if start is None:
             start = 0

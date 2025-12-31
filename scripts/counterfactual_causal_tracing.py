@@ -16,7 +16,7 @@ from activation_patching import PatchSpec, capture_layer_outputs, patch_inputs, 
 from causal_metrics import logit_margin, normalized_use_score, parse_slice, pool_hidden_states
 from counterfactuals import local_swap, motion_destroy, motion_only, reverse_order
 from HookedLVLM import HookedLVLM
-from token_indexing import get_frame_token_spans, get_span_token_slice, get_visual_token_span
+from token_indexing import get_span_token_slice
 from VideoDatasets import VideoQADataset
 from video_utils import format_multiple_choice, load_video_frames
 
@@ -123,9 +123,9 @@ def _collect_representations(
     token_slice: TokenSlice,
     layers: Iterable[int],
     dump_frame_reps: bool,
+    visual_span: slice,
+    frame_spans: Sequence[slice],
 ) -> Dict[str, object]:
-    visual_span = get_visual_token_span(inputs, model.processor)
-    frame_spans = get_frame_token_spans(inputs, model.processor)
     reps: Dict[str, object] = {
         "inputs_mean": pool_hidden_states(inputs_embeds, token_slice).squeeze(0).tolist(),
         "layers_mean": [],
@@ -158,14 +158,12 @@ def _ensure_visual_only(token_slice: TokenSlice, visual_span: slice) -> None:
 
 
 def _save_vprime(
-    inputs: Dict,
     inputs_embeds: torch.Tensor,
-    processor,
+    visual_span: slice,
     out_path: str,
     n_prime: int,
     d_prime: int,
 ) -> str:
-    visual_span = get_visual_token_span(inputs, processor)
     v = inputs_embeds[:, visual_span, :].squeeze(0)
     vprime = F.interpolate(
         v.float().unsqueeze(0).unsqueeze(0),
@@ -278,17 +276,25 @@ def run_causal_tracing(
         )
 
         inputs_clean = model._prepare_inputs(frames, prompt)
+        clean_inputs_embeds = model.get_text_model_in(frames, prompt)
+        seq_len = clean_inputs_embeds.shape[1]
+        visual_span, frame_spans = model.adapter.locate_visual_spans(
+            inputs_clean,
+            clean_inputs_embeds,
+            num_frames,
+        )
         token_slice = parse_slice(
             token_slice_spec,
-            inputs_clean["input_ids"].shape[1],
+            seq_len,
             inputs=inputs_clean,
             processor=model.processor,
+            visual_span=visual_span,
+            frame_spans=frame_spans,
         )
-        visual_span = get_visual_token_span(inputs_clean, model.processor)
         if token_slice_spec.startswith("visual"):
             _ensure_visual_only(token_slice, visual_span)
 
-        t_eff = len(get_frame_token_spans(inputs_clean, model.processor))
+        t_eff = len(frame_spans)
         include_local_swap = True
         if "qwen" in model_id.lower() and t_eff < num_frames:
             include_local_swap = False
@@ -302,8 +308,6 @@ def run_causal_tracing(
             include_motion_only,
             include_local_swap,
         )
-        clean_inputs_embeds = model.get_text_model_in(frames, prompt)
-
         clean_cache: Dict[int, torch.Tensor] = {}
         handles = capture_layer_outputs(model.text_model, layers, clean_cache)
         with torch.no_grad():
@@ -327,13 +331,14 @@ def run_causal_tracing(
                 token_slice,
                 layers,
                 dump_frame_reps,
+                visual_span,
+                frame_spans,
             )
             if dump_vprime and resolved_vprime_dir is not None:
                 vprime_path = os.path.join(resolved_vprime_dir, f"sample_{question_id}_clean_vprime.pt")
                 representations["vprime_path"] = _save_vprime(
-                    inputs_clean,
                     clean_inputs_embeds,
-                    model.processor,
+                    visual_span,
                     vprime_path,
                     vprime_n,
                     vprime_d,
@@ -347,13 +352,14 @@ def run_causal_tracing(
                 token_slice,
                 layers,
                 dump_frame_reps,
+                visual_span,
+                frame_spans,
             )
             if dump_vprime and resolved_vprime_dir is not None:
                 vprime_path = os.path.join(resolved_vprime_dir, f"sample_{question_id}_clean_vprime.pt")
                 representations["vprime_path"] = _save_vprime(
-                    inputs_clean,
                     clean_inputs_embeds,
-                    model.processor,
+                    visual_span,
                     vprime_path,
                     vprime_n,
                     vprime_d,
@@ -387,7 +393,6 @@ def run_causal_tracing(
                     layers,
                 )
                 if name == "local_swap":
-                    frame_spans = get_frame_token_spans(inputs_clean, model.processor)
                     span_slices = get_span_token_slice(swap_spans, frame_spans, raw_T=num_frames)
                     # 处理警告信息
                     if "warnings" in span_slices:
@@ -395,9 +400,11 @@ def run_causal_tracing(
                             print(f"[WARNING] {warning}")
                     text_slice = parse_slice(
                         "text",
-                        inputs_clean["input_ids"].shape[1],
+                        seq_len,
                         inputs=inputs_clean,
                         processor=model.processor,
+                        visual_span=visual_span,
+                        frame_spans=frame_spans,
                     )
                     use_scores_by_span = {
                         "spanA": _compute_use_scores(
@@ -460,6 +467,11 @@ def run_causal_tracing(
                 cf_entry["use_scores_by_span"] = use_scores_by_span
             if dump_representations and not representations_output:
                 cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
+                cf_visual_span, cf_frame_spans = model.adapter.locate_visual_spans(
+                    inputs_cf,
+                    cf_inputs_embeds,
+                    num_frames,
+                )
                 representations = _collect_representations(
                     model,
                     inputs_cf,
@@ -467,6 +479,8 @@ def run_causal_tracing(
                     token_slice,
                     layers,
                     dump_frame_reps,
+                    cf_visual_span,
+                    cf_frame_spans,
                 )
                 if dump_vprime and resolved_vprime_dir is not None:
                     suffix = name
@@ -477,9 +491,8 @@ def run_causal_tracing(
                         f"sample_{question_id}_{suffix}_vprime.pt",
                     )
                     representations["vprime_path"] = _save_vprime(
-                        inputs_cf,
                         cf_inputs_embeds,
-                        model.processor,
+                        cf_visual_span,
                         vprime_path,
                         vprime_n,
                         vprime_d,
@@ -487,6 +500,11 @@ def run_causal_tracing(
                 cf_entry["representations"] = representations
             if dump_representations and representation_results is not None:
                 cf_inputs_embeds = model.get_text_model_in(cf_frames, prompt)
+                cf_visual_span, cf_frame_spans = model.adapter.locate_visual_spans(
+                    inputs_cf,
+                    cf_inputs_embeds,
+                    num_frames,
+                )
                 representations = _collect_representations(
                     model,
                     inputs_cf,
@@ -494,6 +512,8 @@ def run_causal_tracing(
                     token_slice,
                     layers,
                     dump_frame_reps,
+                    cf_visual_span,
+                    cf_frame_spans,
                 )
                 if dump_vprime and resolved_vprime_dir is not None:
                     suffix = name
@@ -504,9 +524,8 @@ def run_causal_tracing(
                         f"sample_{question_id}_{suffix}_vprime.pt",
                     )
                     representations["vprime_path"] = _save_vprime(
-                        inputs_cf,
                         cf_inputs_embeds,
-                        model.processor,
+                        cf_visual_span,
                         vprime_path,
                         vprime_n,
                         vprime_d,
