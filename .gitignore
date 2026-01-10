@@ -13,3 +13,5 @@ infer
 data
 qwen2.log
 scripts/sample_json.py
+tracing_ov.log
+tracing.log
