@@ -20,24 +20,6 @@ class LlavaHFAdapter(VLMAdapter):
         if cache_dir is not None:
             model_kwargs["cache_dir"] = cache_dir
 
-        # 尝试启用 flash-attention
-        use_flash_attention = getattr(self, "use_flash_attention", False)
-        if use_flash_attention:
-            try:
-                import flash_attn
-                # 加载配置并设置 flash attention
-                config = AutoConfig.from_pretrained(self.model_id, trust_remote_code=True)
-                if hasattr(config, "attn_implementation"):
-                    config.attn_implementation = "flash_attention_2"
-                    model_kwargs["attn_implementation"] = "flash_attention_2"
-                elif hasattr(config, "_attn_implementation"):
-                    config._attn_implementation = "flash_attention_2"
-                    model_kwargs["_attn_implementation"] = "flash_attention_2"
-            except ImportError:
-                print("Warning: flash-attn not installed, falling back to default attention.")
-            except Exception as e:
-                print(f"Warning: Failed to enable flash-attention: {e}, falling back to default attention.")
-
         if self.quantize:
             quantize_type = getattr(self, "quantize_type", "fp16")
             if quantize_type == "4bit":
@@ -84,25 +66,26 @@ class LlavaHFAdapter(VLMAdapter):
         _ = AutoConfig.from_pretrained(self.model_id, trust_remote_code=True)
 
     def prepare_inputs(self, frames: List, prompt: str) -> Dict[str, torch.Tensor]:
-        # 强制使用 images 参数而不是 videos 参数
-        # 这是为了避免 LLaVA-OneVision 在 transformers 库中的 bug：
-        # UnboundLocalError: local variable 'special_image_mask' referenced before assignment
-        if hasattr(self.processor, "apply_chat_template"):
-            images = [{"type": "image"} for _ in frames]
-            messages = [
-                {
-                    "role": "user",
-                    "content": [*images, {"type": "text", "text": prompt}],
-                }
-            ]
-            llava_prompt = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+        processor_signature = inspect.signature(self.processor.__call__)
+        if "videos" in processor_signature.parameters:
+            inputs = self.processor(text=prompt, videos=[frames], return_tensors="pt")
         else:
-            img_placeholders = "<image>\n" * len(frames)
-            llava_prompt = f"{img_placeholders}{prompt}"
+            if hasattr(self.processor, "apply_chat_template"):
+                images = [{"type": "image"} for _ in frames]
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [*images, {"type": "text", "text": prompt}],
+                    }
+                ]
+                llava_prompt = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            else:
+                img_placeholders = "<image>\n" * len(frames)
+                llava_prompt = f"{img_placeholders}{prompt}"
 
-        inputs = self.processor(text=llava_prompt, images=frames, return_tensors="pt")
+            inputs = self.processor(text=llava_prompt, images=frames, return_tensors="pt")
 
         device = getattr(self.model, "device", None)
         if device is None:
@@ -132,50 +115,20 @@ class LlavaHFAdapter(VLMAdapter):
         inputs_embeds: torch.Tensor,
         num_frames: int,
     ) -> Tuple[slice, List[slice]]:
-        # 尝试找到图像或视频占位符 token
         image_token_id = getattr(self.model.config, "image_token_index", None)
-        video_token_id = None
         tokenizer = getattr(self.processor, "tokenizer", None)
-        
-        if tokenizer is not None:
-            if image_token_id is None:
-                try:
-                    image_token_id = tokenizer.convert_tokens_to_ids("<image>")
-                except Exception:
-                    pass
-            try:
-                video_token_id = tokenizer.convert_tokens_to_ids("<video>")
-                if video_token_id == tokenizer.unk_token_id:
-                    video_token_id = None
-            except Exception:
-                pass
-        
-        if image_token_id is None and video_token_id is None:
-            raise ValueError(
-                f"Unable to resolve image_token_id or video_token_id for model_id={self.model_id!r}"
-            )
+        if image_token_id is None and tokenizer is not None:
+            image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+        if image_token_id is None:
+            raise ValueError(f"Unable to resolve image_token_id for model_id={self.model_id!r}")
 
         input_ids = inputs["input_ids"][0]
-        # 优先查找 <video> token，如果 input_ids 中没有则查找 <image> token
-        placeholder_token_id = None
-        if video_token_id is not None:
-            video_placeholders = (input_ids == video_token_id).nonzero(as_tuple=False).flatten().tolist()
-            if len(video_placeholders) > 0:
-                placeholder_token_id = video_token_id
-                placeholders = video_placeholders
-        
-        if placeholder_token_id is None and image_token_id is not None:
-            image_placeholders = (input_ids == image_token_id).nonzero(as_tuple=False).flatten().tolist()
-            if len(image_placeholders) > 0:
-                placeholder_token_id = image_token_id
-                placeholders = image_placeholders
-        
-        if placeholder_token_id is None:
-            raise ValueError(
-                f"No <image> or <video> placeholders found in input_ids for model_id={self.model_id!r}."
-            )
-        
+        placeholders = (input_ids == image_token_id).nonzero(as_tuple=False).flatten().tolist()
         n_img = len(placeholders)
+        if n_img == 0:
+            raise ValueError(
+                f"No <image> placeholders found in input_ids for model_id={self.model_id!r}."
+            )
 
         l_ids = inputs["input_ids"].shape[1]
         l_emb = inputs_embeds.shape[1]

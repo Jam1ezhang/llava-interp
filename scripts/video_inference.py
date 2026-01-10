@@ -29,6 +29,7 @@ def run_inference(
     model.model.eval()
 
     results: Dict[str, Dict] = {}
+    stats_printed = False  # 标记是否已打印统计信息
 
     for sample in tqdm(dataset):
         question_id = sample.get("question_id") or sample["video_path"]
@@ -41,6 +42,27 @@ def run_inference(
         question = sample["question"]
         candidates = sample.get("candidates") or []
         prompt = format_multiple_choice(question, candidates) if candidates else question
+
+        # 只在第一次推理时打印 visual tokens 统计信息
+        if not stats_printed:
+            inputs = model._prepare_inputs(video_frames, prompt)
+            inputs_embeds = model.get_text_model_in(video_frames, prompt)
+            print(inputs["input_ids"].tolist())
+            visual_span, frame_spans = model.adapter.locate_visual_spans(
+                inputs, inputs_embeds, num_frames=num_frames
+            )
+            
+            # 计算每帧的 tokens 数量
+            tokens_per_frame = []
+            for span in frame_spans:
+                tokens_per_frame.append(span.stop - span.start)
+            
+            total_visual_tokens = visual_span.stop - visual_span.start
+            avg_tokens_per_frame = total_visual_tokens / num_frames
+            
+            # 打印统计信息（只打印第一行）
+            print(f"Visual tokens: {total_visual_tokens} total, {avg_tokens_per_frame:.1f} per frame (frames: {num_frames}, per-frame tokens: {tokens_per_frame})")
+            stats_printed = True
 
         response = model.generate(
             video_frames,
@@ -63,16 +85,16 @@ def run_inference(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Qwen2-VL/Qwen2.5-VL video inference.")
-    parser.add_argument("--annotations", required=True, help="Path to the video QA json file.")
-    parser.add_argument("--video_root", required=True, help="Root directory containing video files.")
-    parser.add_argument("--output", required=True, help="Path to save inference results.")
+    parser.add_argument("--annotations", required=False,default="/home/user/gptdata/zym/codespace_interp/llava-interp/data/val_qa_situations_with_answer_frames_object_500.json", help="Path to the video QA json file.")
+    parser.add_argument("--video_root", required=False,default="/home/user/gptdata/zym/codespace_interp/video-interp/playground/data/multiple_choice_qa/STAR/Charades_v1_480", help="Root directory containing video files.")
+    parser.add_argument("--output", required=False,default="/home/user/gptdata/zym/codespace_interp/llava-interp/infer/results_ov.json", help="Path to save inference results.")
     parser.add_argument(
         "--model_id",
-        default="Qwen/Qwen2-VL-7B-Instruct",
+        default="/home/user/gptdata/zym/codespace_interp/llava-interp/ckpts/Qwen3-VL-8B-Instruct",
         help="Model ID for Qwen2-VL or Qwen2.5-VL.",
     )
     parser.add_argument("--device", default="cuda:0", help="Device string, e.g. cuda:0 or cpu.")
-    parser.add_argument("--num_frames", type=int, default=8, help="Number of frames to sample from each video.")
+    parser.add_argument("--num_frames", type=int, default=1, help="Number of frames to sample from each video.")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="Maximum number of new tokens to generate.")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on the number of samples.")
 

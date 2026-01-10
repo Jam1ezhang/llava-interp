@@ -60,6 +60,7 @@ class HookedLVLM:
         device: str = "cuda:0",
         quantize: bool = False,
         quantize_type: str = "fp16",
+        use_flash_attention: bool = False,
     ):
         torch_dtype = torch.float16
         if quantize and quantize_type == "int8":
@@ -68,6 +69,7 @@ class HookedLVLM:
         self.adapter = make_adapter(model_id, device, torch_dtype, quantize)
         self.adapter.cache_dir = model_cache_dir
         self.adapter.quantize_type = quantize_type
+        self.adapter.use_flash_attention = use_flash_attention
         self.adapter.load()
 
         self.model = self.adapter.model
@@ -182,6 +184,14 @@ class HookedLVLM:
             num_frames=num_frames,
         )
 
+        # 获取输入长度，用于后续切片
+        input_length = inputs["input_ids"].shape[1]
+        
+        # 获取 EOS token ID（如果存在）
+        eos_token_id = None
+        if hasattr(self.processor, 'tokenizer') and hasattr(self.processor.tokenizer, 'eos_token_id'):
+            eos_token_id = self.processor.tokenizer.eos_token_id
+
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
@@ -189,10 +199,11 @@ class HookedLVLM:
                 output_hidden_states=output_hidden_states,
                 return_dict_in_generate=True,
                 do_sample=do_sample,
+                eos_token_id=eos_token_id,  # 添加 EOS token
             )
 
         response_str = self.processor.batch_decode(
-            output.sequences,
+            output.sequences[:, input_length:],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )[0]

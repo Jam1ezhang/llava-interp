@@ -4,7 +4,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 
 from token_indexing import get_frame_token_spans, get_visual_token_span
 
@@ -19,6 +19,24 @@ class Qwen2VLAdapter(VLMAdapter):
         cache_dir = getattr(self, "cache_dir", None)
         if cache_dir is not None:
             model_kwargs["cache_dir"] = cache_dir
+
+        # 尝试启用 flash-attention
+        use_flash_attention = getattr(self, "use_flash_attention", False)
+        if use_flash_attention:
+            try:
+                import flash_attn
+                # 加载配置并设置 flash attention
+                config = AutoConfig.from_pretrained(self.model_id, trust_remote_code=True)
+                if hasattr(config, "attn_implementation"):
+                    config.attn_implementation = "flash_attention_2"
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+                elif hasattr(config, "_attn_implementation"):
+                    config._attn_implementation = "flash_attention_2"
+                    model_kwargs["_attn_implementation"] = "flash_attention_2"
+            except ImportError:
+                print("Warning: flash-attn not installed, falling back to default attention.")
+            except Exception as e:
+                print(f"Warning: Failed to enable flash-attention: {e}, falling back to default attention.")
 
         if self.quantize:
             quantize_type = getattr(self, "quantize_type", "fp16")
