@@ -43,26 +43,26 @@ def run_inference(
         candidates = sample.get("candidates") or []
         prompt = format_multiple_choice(question, candidates) if candidates else question
 
-        # 只在第一次推理时打印 visual tokens 统计信息
-        if not stats_printed:
-            inputs = model._prepare_inputs(video_frames, prompt)
-            inputs_embeds = model.get_text_model_in(video_frames, prompt)
-            print(inputs["input_ids"].tolist())
-            visual_span, frame_spans = model.adapter.locate_visual_spans(
-                inputs, inputs_embeds, num_frames=num_frames
-            )
+        # # 只在第一次推理时打印 visual tokens 统计信息
+        # if not stats_printed:
+        #     inputs = model._prepare_inputs(video_frames, prompt)
+        #     inputs_embeds = model.get_text_model_in(video_frames, prompt)
+        #     print(inputs["input_ids"].tolist())
+        #     visual_span, frame_spans = model.adapter.locate_visual_spans(
+        #         inputs, inputs_embeds, num_frames=num_frames
+        #     )
             
-            # 计算每帧的 tokens 数量
-            tokens_per_frame = []
-            for span in frame_spans:
-                tokens_per_frame.append(span.stop - span.start)
+        #     # 计算每帧的 tokens 数量
+        #     tokens_per_frame = []
+        #     for span in frame_spans:
+        #         tokens_per_frame.append(span.stop - span.start)
             
-            total_visual_tokens = visual_span.stop - visual_span.start
-            avg_tokens_per_frame = total_visual_tokens / num_frames
+        #     total_visual_tokens = visual_span.stop - visual_span.start
+        #     avg_tokens_per_frame = total_visual_tokens / num_frames
             
-            # 打印统计信息（只打印第一行）
-            print(f"Visual tokens: {total_visual_tokens} total, {avg_tokens_per_frame:.1f} per frame (frames: {num_frames}, per-frame tokens: {tokens_per_frame})")
-            stats_printed = True
+        #     # 打印统计信息（只打印第一行）
+        #     print(f"Visual tokens: {total_visual_tokens} total, {avg_tokens_per_frame:.1f} per frame (frames: {num_frames}, per-frame tokens: {tokens_per_frame})")
+        #     stats_printed = True
 
         response = model.generate(
             video_frames,
@@ -96,7 +96,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0", help="Device string, e.g. cuda:0 or cpu.")
     parser.add_argument("--num_frames", type=int, default=1, help="Number of frames to sample from each video.")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="Maximum number of new tokens to generate.")
-    parser.add_argument("--limit", type=int, default=None, help="Optional limit on the number of samples.")
+    parser.add_argument("--limit", type=int, default=2, help="Optional limit on the number of samples.")
 
     args = parser.parse_args()
     run_inference(

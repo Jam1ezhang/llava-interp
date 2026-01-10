@@ -29,7 +29,10 @@ def create_adapter(
     model_name = _normalize_model_name(model_id)
     model_type = _normalize_model_name(_resolve_model_type(model_id))
 
-    if model_name == "qwen2-vl" or model_type == "qwen2-vl":
+    qwen_markers = ("qwen", "qwen2", "qwen3")
+    if any(marker in model_name for marker in qwen_markers) or any(
+        marker in model_type for marker in qwen_markers
+    ):
         from .qwen2_vl import Qwen2VLAdapter
 
         return Qwen2VLAdapter(model_id, device, torch_dtype, quantize)
